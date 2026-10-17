@@ -1,13 +1,19 @@
+// Per-cell data, indexed by dense grid id.
+@group(1) @binding(0) var<storage, read> cell_plate: array<u32>;
+@group(1) @binding(1) var<storage, read> plate_color: array<vec4<f32>>;
+
 struct VertexOut {
     @builtin(position) clip: vec4<f32>,
     @location(0) unit: vec3<f32>,
+    @location(1) @interpolate(flat) cell: u32,
 };
 
 @vertex
-fn vs_main(@location(0) position: vec3<f32>, @location(1) normal: vec3<f32>) -> VertexOut {
+fn vs_main(@location(0) position: vec3<f32>, @location(1) cell: u32) -> VertexOut {
     var out: VertexOut;
     out.clip = globals.view_proj * vec4<f32>(position * globals.params.z, 1.0);
     out.unit = position;
+    out.cell = cell;
     return out;
 }
 
@@ -39,7 +45,14 @@ fn fs_main(in: VertexOut) -> @location(0) vec4<f32> {
     // Equator and prime meridian.
     let major = max(line_at(abs(lat), d_lat), line_at(abs(lon), d_lon) * pole_fade);
 
-    let base = vec3<f32>(0.25, 0.55, 0.85) * (0.12 + 0.88 * lambert(p));
+    var albedo = vec3<f32>(0.25, 0.55, 0.85);
+    if (globals.layers.x & LAYER_PLATES) != 0u {
+        albedo = plate_color[cell_plate[in.cell]].rgb;
+    }
+    let base = albedo * (0.12 + 0.88 * lambert(p));
+    if (globals.layers.x & LAYER_GRATICULE) == 0u {
+        return vec4<f32>(base, 1.0);
+    }
     var color = mix(base, vec3<f32>(0.85, 0.9, 1.0), minor * 0.35);
     color = mix(color, vec3<f32>(1.0, 1.0, 1.0), major * 0.8);
     return vec4<f32>(color, 1.0);

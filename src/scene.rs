@@ -5,6 +5,8 @@ use glam::DVec3;
 
 use crate::draw::Drawing;
 use crate::geo::{LonLat, great_circle_arc};
+use crate::grid::Grid;
+use crate::plates::Plates;
 
 /// Outlines float this far above the surface (fraction of radius) so they
 /// don't z-fight with the globe's facets.
@@ -17,6 +19,7 @@ const VERTEX_COLOR: [f32; 4] = [0.2, 0.9, 1.0, 1.0];
 const DRAWING_COLOR: [f32; 4] = [0.2, 0.9, 1.0, 1.0];
 const RUBBER_BAND_COLOR: [f32; 4] = [0.2, 0.9, 1.0, 0.5];
 const POLYGON_COLOR: [f32; 4] = [1.0, 0.8, 0.2, 1.0];
+const PLATE_BOUNDARY_COLOR: [f32; 4] = [0.05, 0.05, 0.08, 0.85];
 
 /// A screen-space-width line segment between two world points.
 /// Fields are tightly packed to match `vertex_attr_array!` offsets.
@@ -77,6 +80,18 @@ impl Scene {
             );
         }
         scene
+    }
+
+    /// Outlines along every cell edge where two plates meet. These only
+    /// change when the plates do, so they are built once, not per frame.
+    pub fn plate_boundaries(grid: &Grid, plates: &Plates, radius: f64) -> Vec<Segment> {
+        let mut scene = Scene::default();
+        for (a, b, path) in grid.shared_edges() {
+            if plates.cell_plate[a as usize] != plates.cell_plate[b as usize] {
+                scene.add_path(&path, false, radius, PLATE_BOUNDARY_COLOR);
+            }
+        }
+        scene.segments
     }
 
     fn add_path(&mut self, points: &[DVec3], closed: bool, radius: f64, color: [f32; 4]) {

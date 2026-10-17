@@ -4,7 +4,13 @@ struct Globals {
     light_dir: vec4<f32>,
     // x, y: viewport size in physical pixels; z: planet radius (m); w: line width (px)
     params: vec4<f32>,
+    // x: bitmask of visible LAYER_* flags
+    layers: vec4<u32>,
 };
+
+const LAYER_PLATES: u32 = 1u;
+const LAYER_BOUNDARIES: u32 = 2u;
+const LAYER_GRATICULE: u32 = 4u;
 
 @group(0) @binding(0) var<uniform> globals: Globals;
 

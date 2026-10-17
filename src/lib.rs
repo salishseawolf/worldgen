@@ -5,9 +5,12 @@
 mod camera;
 mod draw;
 mod geo;
+mod grid;
 mod mesh;
+mod plates;
 #[cfg(target_arch = "wasm32")]
 mod renderer;
+mod rng;
 mod scene;
 #[cfg(target_arch = "wasm32")]
 mod web;

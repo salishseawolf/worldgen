@@ -12,12 +12,28 @@
       /* display: grid above beats the UA's [hidden] rule; without this the
          empty overlay covers the canvas and swallows all pointer events. */
       #error[hidden] { display: none; }
-      #hud {
-        position: fixed; top: 12px; left: 12px; max-width: min(320px, calc(100vw - 24px));
-        padding: 10px 12px; border-radius: 8px; background: rgba(10, 12, 18, 0.75);
-        font-size: 13px; line-height: 1.45; pointer-events: none; user-select: none;
+      #panel {
+        position: fixed; top: 12px; left: 12px; width: min(300px, calc(100vw - 24px));
+        display: flex; flex-direction: column; gap: 8px;
+        font-size: 13px; line-height: 1.45; user-select: none;
       }
+      .card { padding: 10px 12px; border-radius: 8px; background: rgba(10, 12, 18, 0.75); }
+      /* The HUD is read-only; let pointer events reach the globe under it. */
+      #hud { pointer-events: none; }
+      .tray h2 { margin: 0 0 4px; font-size: 11px; font-weight: 600; letter-spacing: 0.06em; text-transform: uppercase; color: #8a93a6; }
+      .tray h2:not(:first-child) { margin-top: 10px; }
+      .tray label { display: flex; align-items: center; gap: 8px; padding: 2px 0; cursor: pointer; }
+      .tray input { margin: 0; accent-color: #4de6ff; cursor: pointer; }
+      .tray .world { display: flex; align-items: center; justify-content: space-between; gap: 8px; }
+      #world-seed { font-variant-numeric: tabular-nums; color: #bbb; }
+      .tray button {
+        font: inherit; color: #ddd; background: #232838; border: 1px solid #39405a;
+        border-radius: 6px; padding: 3px 10px; cursor: pointer;
+      }
+      .tray button:hover { background: #2c3347; }
       #hud-cursor { font-variant-numeric: tabular-nums; font-weight: 600; }
+      #hud-cell { font-variant-numeric: tabular-nums; }
+      #hud-cell:empty { display: none; }
       #hud-polygons { margin: 6px 0; padding-left: 18px; }
       #hud-polygons:empty { display: none; }
       #hud-polygons .drawing { color: #4de6ff; }
@@ -26,13 +42,27 @@
   </head>
   <body>
     <canvas id="world"></canvas>
-    <div id="hud">
-      <div id="hud-cursor"></div>
-      <ul id="hud-polygons"></ul>
-      <div class="help">
-        Drag: rotate · Wheel: zoom<br />
-        Click: add vertex · Double-click / Enter: close<br />
-        Backspace: undo vertex · Esc: cancel
+    <div id="panel">
+      <div id="hud" class="card">
+        <div id="hud-cursor"></div>
+        <div id="hud-cell"></div>
+        <ul id="hud-polygons"></ul>
+        <div class="help">
+          Drag: rotate · Wheel: zoom<br />
+          Click: add vertex · Double-click / Enter: close<br />
+          Backspace: undo vertex · Esc: cancel
+        </div>
+      </div>
+      <div class="card tray">
+        <h2>Layers</h2>
+        <label><input type="checkbox" id="layer-plates" checked /> Plates</label>
+        <label><input type="checkbox" id="layer-boundaries" checked /> Plate boundaries</label>
+        <label><input type="checkbox" id="layer-graticule" checked /> Graticule</label>
+        <h2>World</h2>
+        <div class="world">
+          <span id="world-seed"></span>
+          <button type="button" id="new-world">New world</button>
+        </div>
       </div>
     </div>
     <div id="error" hidden></div>

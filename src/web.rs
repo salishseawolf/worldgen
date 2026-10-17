@@ -3,14 +3,19 @@ use std::rc::Rc;
 
 use wasm_bindgen::JsCast;
 use wasm_bindgen::prelude::*;
-use web_sys::{Element, HtmlCanvasElement, KeyboardEvent, PointerEvent, WheelEvent};
+use web_sys::{
+    Element, HtmlCanvasElement, HtmlInputElement, KeyboardEvent, PointerEvent, WheelEvent,
+};
 
 use crate::camera::{OrbitCamera, ray_sphere};
 use crate::draw::Drawing;
 use crate::geo::{EARTH_RADIUS_M, LonLat};
-use crate::renderer::{Globals, Renderer};
+use crate::grid::Grid;
+use crate::plates::Plates;
+use crate::renderer::{Globals, LAYER_BOUNDARIES, LAYER_GRATICULE, LAYER_PLATES, Renderer};
 use crate::scene::Scene;
 use glam::DVec3;
+use h3o::Resolution;
 
 /// Start over the Salish Sea.
 const START_VIEW: LonLat = LonLat::new(-123.0, 48.5);
@@ -18,6 +23,14 @@ const START_ALTITUDE_RADII: f64 = 2.0;
 /// A press that moves less than this (CSS px) is a click, not a drag.
 const CLICK_SLOP_PX: f64 = 4.0;
 const LINE_WIDTH_CSS_PX: f64 = 2.0;
+/// About 41k cells, each roughly 0.6° across: plenty for plates.
+const PLATE_RESOLUTION: Resolution = Resolution::Three;
+/// Layer tray checkboxes and the layer bit each controls.
+const LAYER_TOGGLES: [(&str, u32); 3] = [
+    ("layer-plates", LAYER_PLATES),
+    ("layer-boundaries", LAYER_BOUNDARIES),
+    ("layer-graticule", LAYER_GRATICULE),
+];
 
 type FrameCallback = Rc<RefCell<Option<Closure<dyn FnMut(f64)>>>>;
 
@@ -47,10 +60,18 @@ struct App {
     renderer: Renderer,
     camera: OrbitCamera,
     drawing: Drawing,
+    grid: Grid,
+    plates: Plates,
+    /// World seed, mirrored in the URL as `?seed=` so worlds can be shared.
+    seed: u64,
+    /// Visible `LAYER_*` bits, mirroring the tray checkboxes.
+    layers: u32,
     /// Cursor in CSS pixels relative to the canvas, if over it.
     cursor: Option<(f64, f64)>,
     press: Option<Press>,
     hud_cursor: Element,
+    hud_cell: Element,
+    world_seed: Element,
     hud_polygons: Element,
     hud_dirty: bool,
 }
@@ -76,6 +97,24 @@ impl App {
         ray_sphere(&self.camera.ray(x, y), self.camera.radius).map(DVec3::normalize)
     }
 
+    /// Regenerate the plates from `seed` and record it in the URL.
+    fn set_seed(&mut self, seed: u64) {
+        self.seed = seed;
+        self.plates = Plates::generate(&self.grid, seed);
+        let boundaries = Scene::plate_boundaries(&self.grid, &self.plates, self.camera.radius);
+        self.renderer.set_plates(&self.plates, &boundaries);
+        write_seed_to_url(seed);
+        self.hud_dirty = true;
+    }
+
+    fn set_layer(&mut self, bit: u32, on: bool) {
+        if on {
+            self.layers |= bit;
+        } else {
+            self.layers &= !bit;
+        }
+    }
+
     fn frame(&mut self) {
         let (width, height) = self.renderer.sync_size();
         self.camera.aspect = width as f64 / height as f64;
@@ -91,6 +130,7 @@ impl App {
                 self.camera.radius as f32,
                 (LINE_WIDTH_CSS_PX * dpr) as f32,
             ],
+            layers: [self.layers, 0, 0, 0],
         };
         let scene = Scene::build(
             &self.drawing,
@@ -104,13 +144,24 @@ impl App {
 
     fn update_hud(&mut self, hover: Option<LonLat>) {
         let text = hover.map_or_else(|| "Off the globe".to_string(), LonLat::display);
-        if self.hud_cursor.text_content().as_deref() != Some(text.as_str()) {
-            self.hud_cursor.set_text_content(Some(&text));
-        }
+        set_text(&self.hud_cursor, &text);
+        let cell = hover.map_or_else(String::new, |h| {
+            let id = self.grid.cell_at(h);
+            let plate = self.plates.plate_at(id);
+            format!(
+                "Cell {} · plate {}, {}, {:.1} cm/yr",
+                self.grid.cells[id as usize],
+                self.plates.cell_plate[id as usize] + 1,
+                plate.kind.name(),
+                plate.speed_cm_per_year(h.to_unit(), self.camera.radius)
+            )
+        });
+        set_text(&self.hud_cell, &cell);
         if !self.hud_dirty {
             return;
         }
         self.hud_dirty = false;
+        set_text(&self.world_seed, &format!("Seed {}", self.seed));
         let mut html: String = self
             .drawing
             .polygons
@@ -181,6 +232,15 @@ impl App {
     }
 
     fn key_down(&mut self, e: &KeyboardEvent) {
+        // Leave browser shortcuts alone, and keys aimed at tray controls
+        // (Enter on a focused button must not also close a polygon).
+        let on_control = e
+            .target()
+            .and_then(|t| t.dyn_into::<Element>().ok())
+            .is_some_and(|el| matches!(el.tag_name().as_str(), "INPUT" | "BUTTON"));
+        if on_control || e.ctrl_key() || e.meta_key() || e.alt_key() {
+            return;
+        }
         match e.key().as_str() {
             "Enter" => {
                 self.drawing.close();
@@ -198,6 +258,34 @@ impl App {
         // deltaMode 1 is lines; treat a line as about 16 px.
         let px = e.delta_y() * if e.delta_mode() == 1 { 16.0 } else { 1.0 };
         self.camera.zoom(px * 0.001);
+    }
+}
+
+fn set_text(el: &Element, text: &str) {
+    if el.text_content().as_deref() != Some(text) {
+        el.set_text_content(Some(text));
+    }
+}
+
+/// A new seed small enough to read and type in the URL.
+fn random_seed() -> u64 {
+    (js_sys::Math::random() * u32::MAX as f64) as u64
+}
+
+/// The `seed` parameter of a query string like `?seed=42`.
+fn seed_from_query(query: &str) -> Option<u64> {
+    query
+        .trim_start_matches('?')
+        .split('&')
+        .find_map(|pair| pair.strip_prefix("seed="))
+        .and_then(|v| v.parse().ok())
+}
+
+fn write_seed_to_url(seed: u64) {
+    // replaceState, so regenerating doesn't flood the back button.
+    let url = format!("?seed={seed}");
+    if let Some(history) = web_sys::window().and_then(|w| w.history().ok()) {
+        let _ = history.replace_state_with_url(&JsValue::NULL, "", Some(&url));
     }
 }
 
@@ -239,16 +327,33 @@ async fn run() -> Result<(), String> {
         );
     }
 
-    let renderer = Renderer::new(canvas.clone()).await?;
+    let seed = window
+        .location()
+        .search()
+        .ok()
+        .and_then(|q| seed_from_query(&q))
+        .unwrap_or_else(random_seed);
+    write_seed_to_url(seed);
+    let grid = Grid::new(PLATE_RESOLUTION);
+    let plates = Plates::generate(&grid, seed);
+    let boundaries = Scene::plate_boundaries(&grid, &plates, EARTH_RADIUS_M);
+
+    let renderer = Renderer::new(canvas.clone(), &grid, &plates, &boundaries).await?;
     let aspect = canvas.client_width().max(1) as f64 / canvas.client_height().max(1) as f64;
     let app = Rc::new(RefCell::new(App {
         canvas: canvas.clone(),
         renderer,
         camera: OrbitCamera::over(EARTH_RADIUS_M, START_VIEW, START_ALTITUDE_RADII, aspect),
         drawing: Drawing::default(),
+        grid,
+        plates,
+        seed,
+        layers: 0,
         cursor: None,
         press: None,
         hud_cursor: element("hud-cursor")?,
+        hud_cell: element("hud-cell")?,
+        world_seed: element("world-seed")?,
         hud_polygons: element("hud-polygons")?,
         hud_dirty: true,
     }));
@@ -273,6 +378,24 @@ async fn run() -> Result<(), String> {
     listen(&canvas, "wheel", &app, |app, e: WheelEvent| app.wheel(&e));
     listen(&window, "keydown", &app, |app, e: KeyboardEvent| {
         app.key_down(&e)
+    });
+
+    // The checkboxes' `checked` attributes in index.html set the defaults.
+    for (id, bit) in LAYER_TOGGLES {
+        let input: HtmlInputElement = element(id)?
+            .dyn_into()
+            .map_err(|_| format!("#{id} is not an input"))?;
+        app.borrow_mut().set_layer(bit, input.checked());
+        listen(
+            &input.clone(),
+            "change",
+            &app,
+            move |app, _: web_sys::Event| app.set_layer(bit, input.checked()),
+        );
+    }
+    let new_world = element("new-world")?;
+    listen(&new_world, "click", &app, |app, _: web_sys::Event| {
+        app.set_seed(random_seed())
     });
 
     animate(app);

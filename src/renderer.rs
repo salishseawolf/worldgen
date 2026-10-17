@@ -1,12 +1,18 @@
 use web_sys::HtmlCanvasElement;
 use wgpu::util::DeviceExt;
 
-use crate::mesh::{Mesh, Vertex, cylinder, icosphere};
+use crate::grid::Grid;
+use crate::mesh::{CellVertex, Vertex, cell_mesh, cylinder};
+use crate::plates::Plates;
 use crate::scene::{Column, Scene, Segment};
 
 const DEPTH_FORMAT: wgpu::TextureFormat = wgpu::TextureFormat::Depth32Float;
-const GLOBE_SUBDIVISIONS: u32 = 6;
 const COLUMN_SIDES: u32 = 16;
+
+/// Bits of `Globals::layers[0]`; must match common.wgsl.
+pub const LAYER_PLATES: u32 = 1;
+pub const LAYER_BOUNDARIES: u32 = 2;
+pub const LAYER_GRATICULE: u32 = 4;
 
 #[repr(C)]
 #[derive(Clone, Copy, bytemuck::Pod, bytemuck::Zeroable)]
@@ -15,6 +21,8 @@ pub struct Globals {
     pub light_dir: [f32; 4],
     /// Viewport width and height (physical px), planet radius (m), line width (px).
     pub params: [f32; 4],
+    /// Bitmask of visible `LAYER_*` flags, then unused.
+    pub layers: [u32; 4],
 }
 
 macro_rules! shader {
@@ -39,19 +47,24 @@ struct GpuMesh {
 }
 
 impl GpuMesh {
-    fn new(device: &wgpu::Device, label: &str, mesh: &Mesh) -> Self {
+    fn new<V: bytemuck::Pod>(
+        device: &wgpu::Device,
+        label: &str,
+        vertices: &[V],
+        indices: &[u32],
+    ) -> Self {
         Self {
             vertices: device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
                 label: Some(label),
-                contents: bytemuck::cast_slice(&mesh.vertices),
+                contents: bytemuck::cast_slice(vertices),
                 usage: wgpu::BufferUsages::VERTEX,
             }),
             indices: device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
                 label: Some(label),
-                contents: bytemuck::cast_slice(&mesh.indices),
+                contents: bytemuck::cast_slice(indices),
                 usage: wgpu::BufferUsages::INDEX,
             }),
-            index_count: mesh.indices.len() as u32,
+            index_count: indices.len() as u32,
         }
     }
 }
@@ -103,6 +116,9 @@ pub struct Renderer {
     globals_bind_group: wgpu::BindGroup,
     globe_pipeline: wgpu::RenderPipeline,
     globe: GpuMesh,
+    plate_layout: wgpu::BindGroupLayout,
+    plate_bind_group: wgpu::BindGroup,
+    plate_boundaries: InstanceBuffer,
     column_pipeline: wgpu::RenderPipeline,
     column_mesh: GpuMesh,
     columns: InstanceBuffer,
@@ -111,7 +127,12 @@ pub struct Renderer {
 }
 
 impl Renderer {
-    pub async fn new(canvas: HtmlCanvasElement) -> Result<Self, String> {
+    pub async fn new(
+        canvas: HtmlCanvasElement,
+        grid: &Grid,
+        plates: &Plates,
+        boundaries: &[Segment],
+    ) -> Result<Self, String> {
         let instance = wgpu::Instance::new(wgpu::InstanceDescriptor {
             backends: wgpu::Backends::BROWSER_WEBGPU,
             ..wgpu::InstanceDescriptor::new_without_display_handle()
@@ -186,6 +207,26 @@ impl Renderer {
             immediate_size: 0,
         });
 
+        let storage_entry = |binding| wgpu::BindGroupLayoutEntry {
+            binding,
+            visibility: wgpu::ShaderStages::FRAGMENT,
+            ty: wgpu::BindingType::Buffer {
+                ty: wgpu::BufferBindingType::Storage { read_only: true },
+                has_dynamic_offset: false,
+                min_binding_size: None,
+            },
+            count: None,
+        };
+        let plate_layout = device.create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor {
+            label: Some("plates"),
+            entries: &[storage_entry(0), storage_entry(1)],
+        });
+        let globe_layout = device.create_pipeline_layout(&wgpu::PipelineLayoutDescriptor {
+            label: Some("globe"),
+            bind_group_layouts: &[Some(&bind_group_layout), Some(&plate_layout)],
+            immediate_size: 0,
+        });
+
         let mesh_layout = wgpu::VertexBufferLayout {
             array_stride: std::mem::size_of::<Vertex>() as u64,
             step_mode: wgpu::VertexStepMode::Vertex,
@@ -195,10 +236,14 @@ impl Renderer {
         let globe_shader = shader!(device, "globe.wgsl");
         let globe_pipeline = create_pipeline(
             &device,
-            &layout,
+            &globe_layout,
             "globe",
             &globe_shader,
-            &[Some(mesh_layout.clone())],
+            &[Some(wgpu::VertexBufferLayout {
+                array_stride: std::mem::size_of::<CellVertex>() as u64,
+                step_mode: wgpu::VertexStepMode::Vertex,
+                attributes: &wgpu::vertex_attr_array![0 => Float32x3, 1 => Uint32],
+            })],
             format,
             Some(wgpu::Face::Back),
             true,
@@ -244,10 +289,17 @@ impl Renderer {
             Some(wgpu::BlendState::ALPHA_BLENDING),
         );
 
+        let (globe_vertices, globe_indices) = cell_mesh(grid);
+        let column = cylinder(COLUMN_SIDES);
+        let mut plate_boundaries = InstanceBuffer::new(&device, "plate boundaries");
+        plate_boundaries.write(&device, &queue, boundaries);
         Ok(Self {
             depth_view: create_depth_view(&device, width, height),
-            globe: GpuMesh::new(&device, "globe", &icosphere(GLOBE_SUBDIVISIONS)),
-            column_mesh: GpuMesh::new(&device, "column", &cylinder(COLUMN_SIDES)),
+            globe: GpuMesh::new(&device, "globe", &globe_vertices, &globe_indices),
+            plate_bind_group: create_plate_bind_group(&device, &plate_layout, plates),
+            plate_layout,
+            plate_boundaries,
+            column_mesh: GpuMesh::new(&device, "column", &column.vertices, &column.indices),
             columns: InstanceBuffer::new(&device, "column instances"),
             segments: InstanceBuffer::new(&device, "segment instances"),
             canvas,
@@ -274,6 +326,13 @@ impl Renderer {
             self.depth_view = create_depth_view(&self.device, width, height);
         }
         (width, height)
+    }
+
+    /// Replace the plate data, e.g. after regenerating with a new seed.
+    pub fn set_plates(&mut self, plates: &Plates, boundaries: &[Segment]) {
+        self.plate_bind_group = create_plate_bind_group(&self.device, &self.plate_layout, plates);
+        self.plate_boundaries
+            .write(&self.device, &self.queue, boundaries);
     }
 
     pub fn render(&mut self, globals: &Globals, scene: &Scene) {
@@ -327,6 +386,7 @@ impl Renderer {
             pass.set_bind_group(0, &self.globals_bind_group, &[]);
 
             pass.set_pipeline(&self.globe_pipeline);
+            pass.set_bind_group(1, &self.plate_bind_group, &[]);
             pass.set_vertex_buffer(0, self.globe.vertices.slice(..));
             pass.set_index_buffer(self.globe.indices.slice(..), wgpu::IndexFormat::Uint32);
             pass.draw_indexed(0..self.globe.index_count, 0, 0..1);
@@ -343,8 +403,12 @@ impl Renderer {
             }
 
             // Lines last: they test depth but don't write it, and blend.
+            pass.set_pipeline(&self.line_pipeline);
+            if globals.layers[0] & LAYER_BOUNDARIES != 0 && self.plate_boundaries.count > 0 {
+                pass.set_vertex_buffer(0, self.plate_boundaries.buffer.slice(..));
+                pass.draw(0..6, 0..self.plate_boundaries.count);
+            }
             if self.segments.count > 0 {
-                pass.set_pipeline(&self.line_pipeline);
                 pass.set_vertex_buffer(0, self.segments.buffer.slice(..));
                 pass.draw(0..6, 0..self.segments.count);
             }
@@ -399,6 +463,41 @@ fn create_pipeline(
         multisample: Default::default(),
         multiview_mask: None,
         cache: None,
+    })
+}
+
+fn create_plate_bind_group(
+    device: &wgpu::Device,
+    layout: &wgpu::BindGroupLayout,
+    plates: &Plates,
+) -> wgpu::BindGroup {
+    let colors: Vec<[f32; 4]> = plates
+        .plates
+        .iter()
+        .map(|p| [p.color[0], p.color[1], p.color[2], 1.0])
+        .collect();
+    let storage = |label, contents: &[u8]| {
+        device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
+            label: Some(label),
+            contents,
+            usage: wgpu::BufferUsages::STORAGE,
+        })
+    };
+    let cell_plate = storage("cell plate", bytemuck::cast_slice(&plates.cell_plate));
+    let plate_color = storage("plate color", bytemuck::cast_slice(&colors));
+    device.create_bind_group(&wgpu::BindGroupDescriptor {
+        label: Some("plates"),
+        layout,
+        entries: &[
+            wgpu::BindGroupEntry {
+                binding: 0,
+                resource: cell_plate.as_entire_binding(),
+            },
+            wgpu::BindGroupEntry {
+                binding: 1,
+                resource: plate_color.as_entire_binding(),
+            },
+        ],
     })
 }
 

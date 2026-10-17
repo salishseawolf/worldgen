@@ -1,7 +1,7 @@
-use std::collections::HashMap;
-
 use bytemuck::{Pod, Zeroable};
-use glam::Vec3;
+use glam::DVec3;
+
+use crate::grid::Grid;
 
 #[repr(C)]
 #[derive(Clone, Copy, Pod, Zeroable)]
@@ -15,84 +15,34 @@ pub struct Mesh {
     pub indices: Vec<u32>,
 }
 
-/// Unit icosphere: an icosahedron with each triangle split into four,
-/// `subdivisions` times, and every vertex pushed out onto the sphere.
-pub fn icosphere(subdivisions: u32) -> Mesh {
-    let t = (1.0 + 5.0_f32.sqrt()) / 2.0;
-    let mut positions: Vec<Vec3> = [
-        [-1.0, t, 0.0],
-        [1.0, t, 0.0],
-        [-1.0, -t, 0.0],
-        [1.0, -t, 0.0],
-        [0.0, -1.0, t],
-        [0.0, 1.0, t],
-        [0.0, -1.0, -t],
-        [0.0, 1.0, -t],
-        [t, 0.0, -1.0],
-        [t, 0.0, 1.0],
-        [-t, 0.0, -1.0],
-        [-t, 0.0, 1.0],
-    ]
-    .iter()
-    .map(|p| Vec3::from_array(*p).normalize())
-    .collect();
+/// Globe vertex: a point on the unit sphere and the grid cell it belongs to.
+#[repr(C)]
+#[derive(Clone, Copy, Pod, Zeroable)]
+pub struct CellVertex {
+    pub position: [f32; 3],
+    pub cell: u32,
+}
 
-    let mut faces: Vec<[u32; 3]> = vec![
-        [0, 11, 5],
-        [0, 5, 1],
-        [0, 1, 7],
-        [0, 7, 10],
-        [0, 10, 11],
-        [1, 5, 9],
-        [5, 11, 4],
-        [11, 10, 2],
-        [10, 7, 6],
-        [7, 1, 8],
-        [3, 9, 4],
-        [3, 4, 2],
-        [3, 2, 6],
-        [3, 6, 8],
-        [3, 8, 9],
-        [4, 9, 5],
-        [2, 4, 11],
-        [6, 2, 10],
-        [8, 6, 7],
-        [9, 8, 1],
-    ];
-
-    for _ in 0..subdivisions {
-        // Shared edges must reuse the same midpoint vertex.
-        let mut midpoints: HashMap<(u32, u32), u32> = HashMap::new();
-        let mut midpoint = |a: u32, b: u32| -> u32 {
-            let key = (a.min(b), a.max(b));
-            *midpoints.entry(key).or_insert_with(|| {
-                let p = (positions[a as usize] + positions[b as usize]).normalize();
-                positions.push(p);
-                (positions.len() - 1) as u32
-            })
+/// The globe as one triangle fan per grid cell (center plus boundary), so
+/// each fragment knows its cell and can read per-cell data from a buffer.
+pub fn cell_mesh(grid: &Grid) -> (Vec<CellVertex>, Vec<u32>) {
+    let mut vertices = Vec::new();
+    let mut indices = Vec::new();
+    for id in 0..grid.len() as u32 {
+        let vertex = |p: DVec3| CellVertex {
+            position: p.as_vec3().to_array(),
+            cell: id,
         };
-        faces = faces
-            .iter()
-            .flat_map(|&[a, b, c]| {
-                let ab = midpoint(a, b);
-                let bc = midpoint(b, c);
-                let ca = midpoint(c, a);
-                [[a, ab, ca], [b, bc, ab], [c, ca, bc], [ab, bc, ca]]
-            })
-            .collect();
+        let center = vertices.len() as u32;
+        vertices.push(vertex(grid.centers[id as usize]));
+        let boundary = grid.boundary(id);
+        vertices.extend(boundary.iter().map(|&p| vertex(p)));
+        let n = boundary.len() as u32;
+        for k in 0..n {
+            indices.extend([center, center + 1 + k, center + 1 + (k + 1) % n]);
+        }
     }
-
-    Mesh {
-        // On a unit sphere the normal is the position.
-        vertices: positions
-            .iter()
-            .map(|p| Vertex {
-                position: p.to_array(),
-                normal: p.to_array(),
-            })
-            .collect(),
-        indices: faces.into_iter().flatten().collect(),
-    }
+    (vertices, indices)
 }
 
 /// Unit cylinder around +Y with radius 1, from slightly below 0 (so it sinks
@@ -139,21 +89,19 @@ pub fn cylinder(sides: u32) -> Mesh {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use glam::Vec3;
+    use h3o::Resolution;
 
     #[test]
-    fn subdivision_counts() {
-        // V = 10 * 4^n + 2, F = 20 * 4^n
-        for n in 0..4 {
-            let m = icosphere(n);
-            assert_eq!(m.vertices.len(), 10 * 4usize.pow(n) + 2);
-            assert_eq!(m.indices.len(), 3 * 20 * 4usize.pow(n));
-        }
-    }
-
-    #[test]
-    fn vertices_on_unit_sphere() {
-        for v in icosphere(3).vertices {
-            assert!((Vec3::from_array(v.position).length() - 1.0).abs() < 1e-5);
+    fn cell_mesh_faces_outward() {
+        let grid = Grid::new(Resolution::Three);
+        let (vertices, indices) = cell_mesh(&grid);
+        let pos = |i: u32| Vec3::from_array(vertices[i as usize].position);
+        for tri in indices.chunks(3).step_by(37) {
+            let (a, b, c) = (pos(tri[0]), pos(tri[1]), pos(tri[2]));
+            assert!((b - a).cross(c - a).dot(a) > 0.0, "front faces are CCW");
+            let cells: Vec<u32> = tri.iter().map(|&i| vertices[i as usize].cell).collect();
+            assert!(cells[0] == cells[1] && cells[1] == cells[2]);
         }
     }
 }
