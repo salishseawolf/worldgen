@@ -11,6 +11,7 @@ mod mantle;
 mod measure;
 mod mesh;
 mod palette;
+mod perf;
 mod plates;
 mod projection;
 #[cfg(target_arch = "wasm32")]

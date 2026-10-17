@@ -6,7 +6,9 @@ use crate::mesh::{CellVertex, Vertex, cell_mesh, cylinder};
 use crate::palette;
 use crate::projection::Projection;
 use crate::scene::{Column, Scene, Segment};
-use crate::view::{LAYER_BOUNDARIES, LAYER_MANTLE, LAYER_MOTION};
+use crate::view::{
+    LAYER_BOUNDARIES, LAYER_HOTSPOTS, LAYER_MANTLE, LAYER_MOTION, LAYER_PROVINCES, LAYER_TRACKS,
+};
 use crate::world::World;
 
 const DEPTH_FORMAT: wgpu::TextureFormat = wgpu::TextureFormat::Depth32Float;
@@ -16,7 +18,14 @@ const CELL_MAP_SIZE: u32 = 1024;
 const CELL_MAP_FORMAT: wgpu::TextureFormat = wgpu::TextureFormat::R32Uint;
 
 /// Line overlays, each drawn when its layer bit is set.
-pub const OVERLAYS: [u32; 3] = [LAYER_BOUNDARIES, LAYER_MOTION, LAYER_MANTLE];
+pub const OVERLAYS: [u32; 6] = [
+    LAYER_BOUNDARIES,
+    LAYER_MOTION,
+    LAYER_MANTLE,
+    LAYER_PROVINCES,
+    LAYER_HOTSPOTS,
+    LAYER_TRACKS,
+];
 
 /// Per-cell surface data; matches `CellData` in surface.wgsl.
 #[repr(C)]
@@ -27,6 +36,7 @@ struct CellData {
     /// Seafloor age (Myr), or -1 for continental crust.
     age_myr: f32,
     thickness_km: f32,
+    dynamic_m: f32,
 }
 
 #[repr(C)]
@@ -66,6 +76,20 @@ struct GpuMesh {
     vertices: wgpu::Buffer,
     indices: wgpu::Buffer,
     index_count: u32,
+}
+
+impl GpuMesh {
+    fn bytes(&self) -> u64 {
+        self.vertices.size() + self.indices.size()
+    }
+}
+
+/// What the last frame drew, for the performance panel.
+#[derive(Clone, Copy, Default)]
+pub struct FrameCounts {
+    pub draw_calls: u32,
+    pub triangles: u64,
+    pub line_segments: u64,
 }
 
 impl GpuMesh {
@@ -144,6 +168,10 @@ pub struct Renderer {
     cell_map: wgpu::TextureView,
     surface_layout: wgpu::BindGroupLayout,
     surface_bind_group: wgpu::BindGroup,
+    /// Bytes in the surface bind group's buffers.
+    surface_bytes: u64,
+    /// What the last frame drew.
+    pub counts: FrameCounts,
     /// Line overlays in the order of `OVERLAYS`.
     overlays: Vec<InstanceBuffer>,
     column_pipeline: wgpu::RenderPipeline,
@@ -356,15 +384,14 @@ impl Renderer {
         let globe = GpuMesh::new(&device, "globe", &globe_vertices, &globe_indices);
         let cell_map = bake_cell_map(&device, &queue, &globe, cell_vertex_layout);
         let column = cylinder(COLUMN_SIDES);
+        let (surface_bind_group, surface_bytes) =
+            create_surface_bind_group(&device, &surface_layout, world, &cell_map);
         Ok(Self {
             depth_view: create_depth_view(&device, width, height),
             globe,
-            surface_bind_group: create_surface_bind_group(
-                &device,
-                &surface_layout,
-                world,
-                &cell_map,
-            ),
+            surface_bind_group,
+            surface_bytes,
+            counts: FrameCounts::default(),
             cell_map,
             map_pipeline,
             surface_layout,
@@ -389,6 +416,27 @@ impl Renderer {
         })
     }
 
+    /// Estimated GPU memory we have allocated: meshes, per-cell data, the
+    /// cell-id cube map, the depth buffer and instance buffers. Excludes the
+    /// browser's own canvas buffers.
+    pub fn gpu_bytes(&self) -> u64 {
+        let cell_map = CELL_MAP_SIZE as u64 * CELL_MAP_SIZE as u64 * 6 * 4;
+        let depth = self.config.width as u64 * self.config.height as u64 * 4;
+        let instances: u64 = self
+            .overlays
+            .iter()
+            .chain([&self.columns, &self.segments])
+            .map(|b| b.buffer.size())
+            .sum();
+        self.globe.bytes()
+            + self.column_mesh.bytes()
+            + self.surface_bytes
+            + self.globals_buffer.size()
+            + cell_map
+            + depth
+            + instances
+    }
+
     /// Resize the surface to the canvas's displayed size if it changed, and
     /// return the size in physical pixels.
     pub fn sync_size(&mut self) -> (u32, u32) {
@@ -404,7 +452,7 @@ impl Renderer {
 
     /// Replace the per-cell surface data, e.g. after regenerating.
     pub fn set_world(&mut self, world: &World) {
-        self.surface_bind_group =
+        (self.surface_bind_group, self.surface_bytes) =
             create_surface_bind_group(&self.device, &self.surface_layout, world, &self.cell_map);
     }
 
@@ -470,14 +518,20 @@ impl Renderer {
             pass.set_bind_group(0, &self.globals_bind_group, &[]);
 
             pass.set_bind_group(1, &self.surface_bind_group, &[]);
+            let mut counts = FrameCounts {
+                draw_calls: 1,
+                ..Default::default()
+            };
             if globals.flags[1] == Projection::Globe.id() {
                 pass.set_pipeline(&self.globe_pipeline);
                 pass.set_vertex_buffer(0, self.globe.vertices.slice(..));
                 pass.set_index_buffer(self.globe.indices.slice(..), wgpu::IndexFormat::Uint32);
                 pass.draw_indexed(0..self.globe.index_count, 0, 0..1);
+                counts.triangles += self.globe.index_count as u64 / 3;
             } else {
                 pass.set_pipeline(&self.map_pipeline);
                 pass.draw(0..3, 0..1);
+                counts.triangles += 1;
             }
 
             if self.columns.count > 0 {
@@ -489,20 +543,28 @@ impl Renderer {
                     wgpu::IndexFormat::Uint32,
                 );
                 pass.draw_indexed(0..self.column_mesh.index_count, 0, 0..self.columns.count);
+                counts.draw_calls += 1;
+                counts.triangles +=
+                    self.column_mesh.index_count as u64 / 3 * self.columns.count as u64;
             }
 
             // Lines last: they test depth but don't write it, and blend.
             pass.set_pipeline(&self.line_pipeline);
-            for (layer, lines) in OVERLAYS.iter().zip(&self.overlays) {
-                if globals.flags[0] & layer != 0 && lines.count > 0 {
-                    pass.set_vertex_buffer(0, lines.buffer.slice(..));
-                    pass.draw(0..6, 0..lines.count);
-                }
+            let visible = OVERLAYS
+                .iter()
+                .zip(&self.overlays)
+                .filter(|(layer, _)| globals.flags[0] & **layer != 0)
+                .map(|(_, lines)| lines)
+                .chain([&self.segments]);
+            for lines in visible.filter(|l| l.count > 0) {
+                pass.set_vertex_buffer(0, lines.buffer.slice(..));
+                pass.draw(0..6, 0..lines.count);
+                counts.draw_calls += 1;
+                // Each segment is a quad of two triangles.
+                counts.line_segments += lines.count as u64;
+                counts.triangles += 2 * lines.count as u64;
             }
-            if self.segments.count > 0 {
-                pass.set_vertex_buffer(0, self.segments.buffer.slice(..));
-                pass.draw(0..6, 0..self.segments.count);
-            }
+            self.counts = counts;
         }
         self.queue.submit([encoder.finish()]);
         self.queue.present(frame);
@@ -562,7 +624,7 @@ fn create_surface_bind_group(
     layout: &wgpu::BindGroupLayout,
     world: &World,
     cell_map: &wgpu::TextureView,
-) -> wgpu::BindGroup {
+) -> (wgpu::BindGroup, u64) {
     let crust = &world.crust;
     let cells: Vec<CellData> = (0..crust.kind.len())
         .map(|c| CellData {
@@ -574,6 +636,7 @@ fn create_surface_bind_group(
                 crust.age_myr[c] as f32
             },
             thickness_km: crust.thickness_km[c] as f32,
+            dynamic_m: world.dynamic_m[c] as f32,
         })
         .collect();
     let colors: Vec<[f32; 4]> = world
@@ -592,7 +655,8 @@ fn create_surface_bind_group(
     let cell_data = storage("cells", bytemuck::cast_slice(&cells));
     let plate_color = storage("plate color", bytemuck::cast_slice(&colors));
     let palettes = storage("palettes", bytemuck::cast_slice(&palette::gpu_table()));
-    device.create_bind_group(&wgpu::BindGroupDescriptor {
+    let bytes = cell_data.size() + plate_color.size() + palettes.size();
+    let group = device.create_bind_group(&wgpu::BindGroupDescriptor {
         label: Some("surface"),
         layout,
         entries: &[
@@ -613,7 +677,8 @@ fn create_surface_bind_group(
                 resource: palettes.as_entire_binding(),
             },
         ],
-    })
+    });
+    (group, bytes)
 }
 
 /// Renders the globe mesh from the planet's center into the six faces of a

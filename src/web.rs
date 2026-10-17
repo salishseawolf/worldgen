@@ -13,13 +13,14 @@ use crate::grid::{Grid, h3_centers};
 use crate::legend::{self, PlateKey};
 use crate::mantle::CM_PER_YEAR;
 use crate::measure::{Measure, Reading};
+use crate::perf::{FrameStats, format_bytes};
 use crate::projection::{MapProjection, MapView, Projection};
 use crate::renderer::{Globals, Renderer};
 use crate::scene::{MANTLE_FLOW_COLOR, PLATE_MOTION_COLOR, Scene};
 use crate::tectonics::{Edge, edges};
 use crate::view::{
-    COLOR_AGE, COLOR_CRUST, COLOR_ELEVATION, COLOR_PLATES, LAYER_BOUNDARIES, LAYER_GRATICULE,
-    LAYER_MANTLE, LAYER_MOTION,
+    COLOR_AGE, COLOR_CRUST, COLOR_ELEVATION, COLOR_MANTLE, COLOR_PLATES, LAYER_BOUNDARIES,
+    LAYER_GRATICULE, LAYER_HOTSPOTS, LAYER_MANTLE, LAYER_MOTION, LAYER_PROVINCES, LAYER_TRACKS,
 };
 use crate::world::World;
 use glam::DVec3;
@@ -36,19 +37,28 @@ const PLATE_RESOLUTION: Resolution = Resolution::Three;
 /// Arrows sit at the centers of this coarser H3 grid (842 cells).
 const ARROW_RESOLUTION: Resolution = Resolution::One;
 /// Layer tray checkboxes and the layer bit each controls.
-const LAYER_TOGGLES: [(&str, u32); 4] = [
+const LAYER_TOGGLES: [(&str, u32); 7] = [
     ("layer-boundaries", LAYER_BOUNDARIES),
     ("layer-motion", LAYER_MOTION),
-    ("layer-mantle", LAYER_MANTLE),
     ("layer-graticule", LAYER_GRATICULE),
+    ("layer-mantle", LAYER_MANTLE),
+    ("layer-provinces", LAYER_PROVINCES),
+    ("layer-hotspots", LAYER_HOTSPOTS),
+    ("layer-tracks", LAYER_TRACKS),
 ];
 /// "Color by" tray radio buttons.
-const COLOR_CHOICES: [(&str, u32); 4] = [
+const COLOR_CHOICES: [(&str, u32); 5] = [
     ("color-elevation", COLOR_ELEVATION),
     ("color-plates", COLOR_PLATES),
     ("color-age", COLOR_AGE),
     ("color-crust", COLOR_CRUST),
+    ("color-mantle", COLOR_MANTLE),
 ];
+/// Dynamic topography below this (m) reads as "little vertical flow".
+const MANTLE_STILL_M: f64 = 50.0;
+/// Within this distance (m) of a deep province's outline, the HUD calls it
+/// the edge, where strong plumes rise.
+const PROVINCE_EDGE_M: f64 = 300_000.0;
 /// Projection tray radio buttons.
 const PROJECTION_CHOICES: [(&str, Projection); 5] = [
     ("proj-globe", Projection::Globe),
@@ -57,6 +67,9 @@ const PROJECTION_CHOICES: [(&str, Projection); 5] = [
     ("proj-albers", Projection::Albers),
     ("proj-azimuthal", Projection::AzimuthalEquidistant),
 ];
+/// How often the performance panel refreshes (ms); updating the page every
+/// frame would itself cost time.
+const PERF_REFRESH_MS: f64 = 250.0;
 /// How long the copy button shows its check mark.
 const COPIED_MS: i32 = 1500;
 /// On flat maps, the cursor column's width in CSS px (see `Scene::build`).
@@ -113,9 +126,23 @@ struct App {
     hud_cursor: Element,
     hud_cell: Element,
     hud_crust: Element,
+    hud_deep: Element,
     world_seed: Element,
     legend: Element,
     hud_dirty: bool,
+    perf: Perf,
+}
+
+/// The performance panel and the numbers behind it.
+struct Perf {
+    stats: FrameStats,
+    card: Element,
+    body: Element,
+    visible: bool,
+    /// When the panel last refreshed (animation frame time, ms).
+    shown_at: f64,
+    /// How long the last world took to generate (ms).
+    generation_ms: f64,
 }
 
 /// The measurement info box.
@@ -171,7 +198,9 @@ impl App {
     /// Regenerate the world from `seed` and record it in the URL.
     fn set_seed(&mut self, seed: u64) {
         self.seed = seed;
+        let start = now_ms();
         self.world = World::generate(&self.grid, &self.edges, seed);
+        self.perf.generation_ms = now_ms() - start;
         self.renderer.set_world(&self.world);
         self.update_overlays();
         self.update_legend();
@@ -226,6 +255,16 @@ impl App {
         self.renderer.set_overlay(LAYER_BOUNDARIES, &boundaries);
         self.renderer.set_overlay(LAYER_MOTION, &motion);
         self.renderer.set_overlay(LAYER_MANTLE, &mantle);
+        self.renderer.set_overlay(
+            LAYER_PROVINCES,
+            &Scene::province_outlines(&w.mantle.provinces, r),
+        );
+        self.renderer
+            .set_overlay(LAYER_HOTSPOTS, &Scene::hotspot_rings(&w.hotspots, r));
+        self.renderer.set_overlay(
+            LAYER_TRACKS,
+            &Scene::hotspot_tracks(&w.hotspots, &w.hotspot_tracks, r),
+        );
     }
 
     fn set_layer(&mut self, bit: u32, on: bool) {
@@ -237,7 +276,69 @@ impl App {
         self.update_legend();
     }
 
-    fn frame(&mut self) {
+    /// One animation frame; `time_ms` is the frame's timestamp.
+    fn frame(&mut self, time_ms: f64) {
+        let start = now_ms();
+        self.draw_frame();
+        self.perf.stats.record(time_ms, now_ms() - start);
+        if self.perf.visible && time_ms - self.perf.shown_at >= PERF_REFRESH_MS {
+            self.perf.shown_at = time_ms;
+            self.update_perf_panel();
+        }
+    }
+
+    fn set_perf_visible(&mut self, visible: bool) {
+        self.perf.visible = visible;
+        if visible {
+            let _ = self.perf.card.remove_attribute("hidden");
+            self.update_perf_panel();
+        } else {
+            let _ = self.perf.card.set_attribute("hidden", "");
+        }
+    }
+
+    fn update_perf_panel(&self) {
+        let row = |label: &str, value: String| format!("<dt>{label}</dt><dd>{value}</dd>");
+        let mut html = String::new();
+        match self.perf.stats.summary() {
+            Some(s) => {
+                html += &row("FPS", format!("{:.1}", s.fps));
+                html += &row(
+                    "Frame time",
+                    format!("{:.1} ms (worst {:.1})", s.frame_ms, s.worst_frame_ms),
+                );
+                html += &row(
+                    "CPU per frame",
+                    format!("{:.2} ms (worst {:.2})", s.cpu_ms, s.worst_cpu_ms),
+                );
+            }
+            None => html += &row("FPS", "measuring".into()),
+        }
+        html += &row(
+            "World generation",
+            format!("{:.0} ms", self.perf.generation_ms),
+        );
+        let dpr = web_sys::window().map_or(1.0, |w| w.device_pixel_ratio());
+        html += &row(
+            "Canvas",
+            format!(
+                "{} × {} px (DPR {dpr})",
+                self.canvas.width(),
+                self.canvas.height()
+            ),
+        );
+        let c = self.renderer.counts;
+        html += &row("Draw calls", c.draw_calls.to_string());
+        html += &row("Triangles", group_thousands(c.triangles));
+        html += &row("Line segments", group_thousands(c.line_segments));
+        html += &row(
+            "GPU memory",
+            format!("≈ {}", format_bytes(self.renderer.gpu_bytes())),
+        );
+        self.perf.body.set_inner_html(&format!("<dl>{html}</dl>"));
+    }
+
+    fn draw_frame(&mut self) {
         let (width, height) = self.renderer.sync_size();
         self.camera.aspect = width as f64 / height as f64;
         let dpr = web_sys::window().map_or(1.0, |w| w.device_pixel_ratio());
@@ -312,12 +413,52 @@ impl App {
         });
         set_text(&self.hud_cell, &cell);
         set_text(&self.hud_crust, &crust);
+        let deep = hover.map_or_else(String::new, |h| self.deep_earth_text(h));
+        set_text(&self.hud_deep, &deep);
         self.update_measure_box();
         if !self.hud_dirty {
             return;
         }
         self.hud_dirty = false;
         set_text(&self.world_seed, &format!("Seed {}", self.seed));
+    }
+
+    /// HUD line about the mantle and any hotspot volcano under `h`.
+    fn deep_earth_text(&self, h: LonLat) -> String {
+        let c = self.grid.cell_at(h) as usize;
+        let d = self.world.dynamic_m[c];
+        let mut text = if d.abs() < MANTLE_STILL_M {
+            "Mantle: little vertical flow".to_string()
+        } else if d > 0.0 {
+            format!("Mantle rising, {}", format_meters(d))
+        } else {
+            format!("Mantle sinking, {}", format_meters(d))
+        };
+        let to_edge = self
+            .world
+            .mantle
+            .provinces
+            .iter()
+            .map(|p| p.edge_distance(h.to_unit()))
+            .fold(f64::MAX, f64::min);
+        if to_edge.abs() * self.camera.radius < PROVINCE_EDGE_M {
+            text += " (deep province edge)";
+        } else if to_edge < 0.0 {
+            text += " (over a deep province)";
+        }
+        if let Some(mark) = self.world.hotspot_marks[c] {
+            let plume = if self.world.hotspots[mark.hotspot as usize].is_strong() {
+                "strong plume"
+            } else {
+                "weak plume"
+            };
+            if mark.age_myr < 1.0 {
+                text += &format!(" · Active hotspot volcano ({plume})");
+            } else {
+                text += &format!(" · Hotspot volcano, {:.0} Myr old ({plume})", mark.age_myr);
+            }
+        }
+        text
     }
 
     /// The current measurement, finished or still following the cursor.
@@ -487,6 +628,13 @@ fn format_meters(m: f64) -> String {
 
 /// Puts `text` on the clipboard and briefly swaps `button`'s icon to a
 /// check mark (see `.copied` in index.html).
+/// Milliseconds from the page's high-resolution clock.
+fn now_ms() -> f64 {
+    web_sys::window()
+        .and_then(|w| w.performance())
+        .map_or(0.0, |p| p.now())
+}
+
 fn copy_to_clipboard(text: &str, button: &Element) {
     let Some(window) = web_sys::window() else {
         return;
@@ -534,7 +682,9 @@ async fn run() -> Result<(), String> {
     write_seed_to_url(seed);
     let grid = Grid::new(PLATE_RESOLUTION);
     let edges = edges(&grid);
+    let start = now_ms();
     let world = World::generate(&grid, &edges, seed);
+    let generation_ms = now_ms() - start;
 
     let renderer = Renderer::new(canvas.clone(), &grid, &world).await?;
     let aspect = canvas.client_width().max(1) as f64 / canvas.client_height().max(1) as f64;
@@ -565,8 +715,17 @@ async fn run() -> Result<(), String> {
         hud_cursor: element("hud-cursor")?,
         hud_cell: element("hud-cell")?,
         hud_crust: element("hud-crust")?,
+        hud_deep: element("hud-deep")?,
         world_seed: element("world-seed")?,
         legend: element("legend")?,
+        perf: Perf {
+            stats: FrameStats::default(),
+            card: element("perf")?,
+            body: element("perf-body")?,
+            visible: false,
+            shown_at: 0.0,
+            generation_ms,
+        },
         hud_dirty: true,
     }));
     app.borrow_mut().update_overlays();
@@ -638,6 +797,16 @@ async fn run() -> Result<(), String> {
             },
         );
     }
+    let perf_toggle: HtmlInputElement = element("perf-stats")?
+        .dyn_into()
+        .map_err(|_| "#perf-stats is not an input")?;
+    app.borrow_mut().set_perf_visible(perf_toggle.checked());
+    listen(
+        &perf_toggle.clone(),
+        "change",
+        &app,
+        move |app, _: web_sys::Event| app.set_perf_visible(perf_toggle.checked()),
+    );
     let copy = element("measure-copy")?;
     listen(&copy, "click", &app, |app, _: web_sys::Event| {
         app.copy_measurement()
@@ -672,8 +841,8 @@ fn listen<E: JsCast + 'static>(
 fn animate(app: Rc<RefCell<App>>) {
     let callback: FrameCallback = Rc::new(RefCell::new(None));
     let next = callback.clone();
-    *callback.borrow_mut() = Some(Closure::new(move |_time_ms: f64| {
-        app.borrow_mut().frame();
+    *callback.borrow_mut() = Some(Closure::new(move |time_ms: f64| {
+        app.borrow_mut().frame(time_ms);
         request_frame(next.borrow().as_ref().unwrap());
     }));
     request_frame(callback.borrow().as_ref().unwrap());

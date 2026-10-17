@@ -21,6 +21,7 @@ const COLOR_PLATES: u32 = 0u;
 const COLOR_ELEVATION: u32 = 1u;
 const COLOR_AGE: u32 = 2u;
 const COLOR_CRUST: u32 = 3u;
+const COLOR_MANTLE: u32 = 4u;
 
 // Must match Projection::id in projection.rs, which also holds the
 // reference (and tested) copy of the projection math below.

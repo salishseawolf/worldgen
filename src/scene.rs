@@ -5,8 +5,10 @@ use glam::DVec3;
 
 use crate::geo::{LonLat, great_circle_arc};
 use crate::mantle::CM_PER_YEAR;
+use crate::mantle::Province;
 use crate::measure::Measure;
-use crate::tectonics::{Boundary, BoundaryKind, Edge};
+use crate::tectonics::{Boundary, BoundaryKind, Edge, RADIUS_KM};
+use crate::world::Hotspot;
 
 /// Outlines float this far above the surface (fraction of radius) so they
 /// don't z-fight with the globe's facets.
@@ -23,6 +25,20 @@ pub const ARROW_DEG_PER_CM_YEAR: f64 = 0.45;
 const ARROW_MAX_DEG: f64 = 7.0;
 pub const PLATE_MOTION_COLOR: [f32; 4] = [0.95, 0.95, 0.95, 0.9];
 pub const MANTLE_FLOW_COLOR: [f32; 4] = [1.0, 0.55, 0.85, 0.9];
+pub const PROVINCE_COLOR: [f32; 4] = [0.6, 0.2, 1.0, 1.0];
+pub const HOTSPOT_COLOR: [f32; 4] = [1.0, 0.35, 0.0, 1.0];
+/// Weak plumes and tracks are drawn fainter.
+const WEAK_ALPHA: f32 = 0.55;
+/// Hotspot ring radii (km) for a strong and a weak plume.
+const RING_STRONG_KM: f64 = 250.0;
+const RING_WEAK_KM: f64 = 110.0;
+/// Track ticks: one every this many Myr, this long either side (km).
+pub const TRACK_TICK_MYR: usize = 10;
+const TRACK_TICK_KM: f64 = 60.0;
+
+fn faint(c: [f32; 4]) -> [f32; 4] {
+    [c[0], c[1], c[2], c[3] * WEAK_ALPHA]
+}
 
 /// Line color for each boundary type; index.html shows the same as a key.
 pub fn boundary_color(kind: BoundaryKind) -> [f32; 4] {
@@ -112,6 +128,69 @@ impl Scene {
         for b in boundaries {
             let path = &edges[b.edge as usize].path;
             scene.add_path(path, false, radius, boundary_color(b.kind));
+        }
+        scene.segments
+    }
+
+    /// Outlines of the deep mantle provinces.
+    pub fn province_outlines(provinces: &[Province], radius: f64) -> Vec<Segment> {
+        let mut scene = Scene::default();
+        for p in provinces {
+            scene.add_path(&p.outline(96), true, radius, PROVINCE_COLOR);
+        }
+        scene.segments
+    }
+
+    /// A ring around each plume, larger and bolder for strong plumes.
+    pub fn hotspot_rings(hotspots: &[Hotspot], radius: f64) -> Vec<Segment> {
+        let mut scene = Scene::default();
+        for h in hotspots {
+            let (km, color) = if h.is_strong() {
+                (RING_STRONG_KM, HOTSPOT_COLOR)
+            } else {
+                (RING_WEAK_KM, faint(HOTSPOT_COLOR))
+            };
+            let r = km / RADIUS_KM;
+            let u = h.position.any_orthonormal_vector();
+            let v = h.position.cross(u);
+            let ring: Vec<DVec3> = (0..32)
+                .map(|i| {
+                    let a = std::f64::consts::TAU * i as f64 / 32.0;
+                    h.position * r.cos() + (u * a.cos() + v * a.sin()) * r.sin()
+                })
+                .collect();
+            scene.add_path(&ring, true, radius, color);
+        }
+        scene.segments
+    }
+
+    /// Each hotspot track (points one Myr apart) as a line with a tick
+    /// across it every [`TRACK_TICK_MYR`].
+    pub fn hotspot_tracks(
+        hotspots: &[Hotspot],
+        tracks: &[Vec<DVec3>],
+        radius: f64,
+    ) -> Vec<Segment> {
+        let mut scene = Scene::default();
+        let tick = TRACK_TICK_KM / RADIUS_KM;
+        for (h, track) in hotspots.iter().zip(tracks) {
+            let color = if h.is_strong() {
+                HOTSPOT_COLOR
+            } else {
+                faint(HOTSPOT_COLOR)
+            };
+            scene.add_path(track, false, radius, color);
+            for i in (TRACK_TICK_MYR..track.len()).step_by(TRACK_TICK_MYR) {
+                let p = track[i];
+                let along = track[i] - track[i - 1];
+                let across = p.cross(along).normalize_or_zero();
+                if across == DVec3::ZERO {
+                    continue;
+                }
+                let a = p * tick.cos() + across * tick.sin();
+                let b = p * tick.cos() - across * tick.sin();
+                scene.add_path(&[a, b], false, radius, color);
+            }
         }
         scene.segments
     }
@@ -213,6 +292,35 @@ mod tests {
         let s = Scene::build(&m, None, EARTH_RADIUS_M, EARTH_RADIUS_M);
         assert!(s.segments.iter().all(|seg| seg.color == MEASURE_COLOR));
         assert_eq!(s.columns.len(), 2, "both ends marked");
+    }
+
+    #[test]
+    fn hotspot_track_has_a_tick_every_ten_myr() {
+        let h = Hotspot {
+            position: DVec3::X,
+            strength: 1.0,
+        };
+        // A track heading east along the equator, 0.1° per Myr.
+        let track = |myr: usize| -> Vec<DVec3> {
+            (0..=myr)
+                .map(|t| LonLat::new(0.1 * t as f64, 0.0).to_unit())
+                .collect()
+        };
+        // Ticks are the only segments that cross the equator.
+        let ticks = |segments: Vec<Segment>| {
+            segments
+                .iter()
+                .filter(|s| (s.a[1] > 0.0) != (s.b[1] > 0.0))
+                .count()
+        };
+        assert_eq!(
+            ticks(Scene::hotspot_tracks(&[h], &[track(9)], EARTH_RADIUS_M)),
+            0
+        );
+        assert_eq!(
+            ticks(Scene::hotspot_tracks(&[h], &[track(25)], EARTH_RADIUS_M)),
+            2
+        );
     }
 
     #[test]

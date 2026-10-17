@@ -24,7 +24,7 @@ use crate::crust::{
 };
 use crate::geo::LonLat;
 use crate::grid::Grid;
-use crate::mantle::MantleFlow;
+use crate::mantle::{MantleFlow, Province};
 use crate::plates::{Plate, Plates};
 use crate::rng::{Pcg32, Stream};
 use crate::tectonics::{
@@ -43,6 +43,9 @@ const STRONG_HOTSPOTS: usize = 8;
 const WEAK_HOTSPOTS: usize = 30;
 const STRONG_STRENGTH: (f64, f64) = (0.7, 1.0);
 const WEAK_STRENGTH: (f64, f64) = (0.1, 0.35);
+/// Strong plumes scatter this far (radians, about 190 km) around the
+/// province edge.
+const PLUME_EDGE_JITTER: f64 = 0.03;
 /// How far back hotspot tracks are traced (Myr).
 const HOTSPOT_TRACK_MYR: u32 = 90;
 
@@ -104,6 +107,22 @@ pub struct World {
     pub mantle: MantleFlow,
     pub boundaries: Vec<Boundary>,
     pub hotspots: Vec<Hotspot>,
+    /// Each hotspot's track: where the plate now carries ground that sat
+    /// over the plume 0, 1, 2, ... Myr ago, while it stays on that plate.
+    pub hotspot_tracks: Vec<Vec<DVec3>>,
+    /// For each cell, the hotspot volcano standing there, if any.
+    pub hotspot_marks: Vec<Option<HotspotMark>>,
+    /// Elevation (m) each cell gains or loses from vertical mantle flow.
+    pub dynamic_m: Vec<f64>,
+}
+
+/// A hotspot volcano on a cell.
+#[derive(Clone, Copy, Debug)]
+pub struct HotspotMark {
+    /// Index into `World::hotspots`.
+    pub hotspot: u32,
+    /// Time since it stood over the plume.
+    pub age_myr: f64,
 }
 
 /// A mantle plume, fixed in the mantle.
@@ -116,28 +135,69 @@ pub struct Hotspot {
 }
 
 impl Hotspot {
-    /// The world's plumes: a few strong ones and many weak ones.
-    fn scatter(seed: u64) -> Vec<Self> {
+    /// The world's plumes. Strong ones rise from the edges of the deep
+    /// mantle provinces, taking turns between them; weak ones anywhere.
+    fn scatter(seed: u64, provinces: &[Province]) -> Vec<Self> {
         let mut rng = Pcg32::for_part(seed, Stream::Hotspots);
         let mut spots: Vec<Self> = (0..STRONG_HOTSPOTS)
-            .map(|_| Self::random(&mut rng, STRONG_STRENGTH))
+            .map(|i| {
+                let province = &provinces[i % provinces.len()];
+                let edge = province.edge_point(rng.range(0.0, std::f64::consts::TAU));
+                let jitter = rng.unit_vector() * PLUME_EDGE_JITTER;
+                Self {
+                    position: (edge + jitter).normalize(),
+                    strength: rng.range(STRONG_STRENGTH.0, STRONG_STRENGTH.1),
+                }
+            })
             .collect();
-        spots.extend((0..WEAK_HOTSPOTS).map(|_| Self::random(&mut rng, WEAK_STRENGTH)));
+        spots.extend((0..WEAK_HOTSPOTS).map(|_| Self {
+            position: rng.unit_vector(),
+            strength: rng.range(WEAK_STRENGTH.0, WEAK_STRENGTH.1),
+        }));
         spots
     }
 
-    fn random(rng: &mut Pcg32, (lo, hi): (f64, f64)) -> Self {
-        Self {
-            position: rng.unit_vector(),
-            strength: rng.range(lo, hi),
+    pub fn is_strong(&self) -> bool {
+        self.strength >= STRONG_STRENGTH.0
+    }
+
+    /// Weaker plumes' volcanoes are shorter-lived and their tracks shorter.
+    fn lifetime(&self) -> f64 {
+        0.4 + 0.6 * self.strength
+    }
+
+    /// Where a plate turning at `omega` has carried, after `t` Myr, the
+    /// ground that sat over the plume.
+    fn carried(&self, omega: DVec3, t: f64) -> DVec3 {
+        if omega.length() < 1e-12 {
+            self.position
+        } else {
+            DQuat::from_axis_angle(omega.normalize(), omega.length() * t) * self.position
         }
     }
+}
+
+/// The track of `hotspot`, one point per Myr, until it leaves the plate the
+/// plume is under or runs out of the hotspot's track length.
+fn hotspot_track(
+    grid: &Grid,
+    cell_plate: &[u32],
+    plates: &[Plate],
+    hotspot: &Hotspot,
+) -> Vec<DVec3> {
+    let plate = cell_plate[grid.cell_at(LonLat::from_vec(hotspot.position)) as usize];
+    let omega = plates[plate as usize].omega;
+    let myr = (HOTSPOT_TRACK_MYR as f64 * hotspot.lifetime()) as u32;
+    (0..=myr)
+        .map(|t| hotspot.carried(omega, t as f64))
+        .take_while(|&p| cell_plate[grid.cell_at(LonLat::from_vec(p)) as usize] == plate)
+        .collect()
 }
 
 impl World {
     pub fn generate(grid: &Grid, edges: &[Edge], seed: u64) -> Self {
         let kind = crust::continents(grid, &mut Pcg32::for_part(seed, Stream::Continents));
-        let mut mantle = MantleFlow::random(grid, &mut Pcg32::for_part(seed, Stream::Mantle));
+        let mut mantle = MantleFlow::earthlike(grid, &mut Pcg32::for_part(seed, Stream::Mantle));
         let mut flow = mantle.sample(grid);
         let mut age = vec![DEFAULT_OCEAN_AGE_MYR; grid.len()];
 
@@ -178,8 +238,7 @@ impl World {
                     let strength = (b.rate / FULL_RATE_CM_YEAR).min(1.0) * 0.3;
                     mantle.add_slab(grid.centers[b.subducting as usize], strength);
                 }
-                mantle.normalize(grid);
-                flow = mantle.sample(grid);
+                flow = mantle.normalize_and_sample(grid);
             }
             omega = solve_motion(
                 grid,
@@ -198,32 +257,31 @@ impl World {
             plate.omega = *w;
         }
 
-        let crust = build_crust(grid, edges, &plates.cell_plate, kind, age, &boundaries);
-        let mut world = World {
+        let mut crust = build_crust(grid, edges, &plates.cell_plate, kind, age, &boundaries);
+        let hotspots = Hotspot::scatter(seed, &mantle.provinces);
+        let relief = hotspot_relief(
+            grid,
+            &plates.cell_plate,
+            &plates.plates,
+            &crust.kind,
+            &hotspots,
+        );
+        let dynamic_m = dynamic_topography(grid, &mantle);
+        for (c, e) in crust.elevation_m.iter_mut().enumerate() {
+            *e += relief.elevation[c] + dynamic_m[c];
+        }
+        World {
+            hotspot_tracks: hotspots
+                .iter()
+                .map(|h| hotspot_track(grid, &plates.cell_plate, &plates.plates, h))
+                .collect(),
+            hotspot_marks: relief.marks,
+            hotspots,
             plates,
             crust,
             mantle,
             boundaries,
-            hotspots: Hotspot::scatter(seed),
-        };
-        world.add_hotspot_tracks(grid);
-        let dynamic = dynamic_topography(grid, &world.mantle);
-        for (e, d) in world.crust.elevation_m.iter_mut().zip(dynamic) {
-            *e += d;
-        }
-        world
-    }
-
-    fn add_hotspot_tracks(&mut self, grid: &Grid) {
-        let relief = hotspot_relief(
-            grid,
-            &self.plates.cell_plate,
-            &self.plates.plates,
-            &self.crust.kind,
-            &self.hotspots,
-        );
-        for (e, r) in self.crust.elevation_m.iter_mut().zip(relief) {
-            *e += r;
+            dynamic_m,
         }
     }
 }
@@ -258,26 +316,19 @@ fn hotspot_relief(
     plates: &[Plate],
     kind: &[CrustKind],
     hotspots: &[Hotspot],
-) -> Vec<f64> {
+) -> HotspotRelief {
     let mut swell = vec![0.0f64; grid.len()];
     let mut volcano = vec![0.0f64; grid.len()];
-    for hotspot in hotspots {
+    let mut marks: Vec<Option<HotspotMark>> = vec![None; grid.len()];
+    for (index, hotspot) in hotspots.iter().enumerate() {
         let (plume, strength) = (hotspot.position, hotspot.strength);
         // Weaker plumes: lower, narrower swells and shorter-lived volcanoes.
         let swell_radius = SWELL_RADIUS_KM * strength.sqrt();
         let swell_reach = (3.0 * swell_radius / RADIUS_KM).cos();
-        let lifetime = 0.4 + 0.6 * strength;
+        let lifetime = hotspot.lifetime();
         let plate = cell_plate[grid.cell_at(LonLat::from_vec(plume)) as usize];
         let omega = plates[plate as usize].omega;
-        // Where the plate material now at `t` Myr downstream sat over the
-        // plume: carried along by the plate's rotation since.
-        let carried = |t: f64| {
-            if omega.length() < 1e-12 {
-                plume
-            } else {
-                DQuat::from_axis_angle(omega.normalize(), omega.length() * t) * plume
-            }
-        };
+        let carried = |t: f64| hotspot.carried(omega, t);
 
         // Cells the swell can reach anywhere along its trail, found once
         // rather than scanning the whole grid for every trail point.
@@ -306,7 +357,7 @@ fn hotspot_relief(
         let km_per_myr = omega.cross(plume).length() * RADIUS_KM;
         let spacing = (VOLCANO_SPACING_KM / km_per_myr.max(1e-3)).clamp(1.0, 15.0);
         let mut t = 0.0;
-        while t <= HOTSPOT_TRACK_MYR as f64 {
+        while t <= HOTSPOT_TRACK_MYR as f64 * lifetime {
             let cell = grid.cell_at(LonLat::from_vec(carried(t)));
             if cell_plate[cell as usize] != plate {
                 break;
@@ -317,14 +368,32 @@ fn hotspot_relief(
                 } else {
                     VOLCANO_OCEAN_M * (-t / (VOLCANO_OCEAN_DECAY_MYR * lifetime)).exp()
                 };
-            volcano[cell as usize] = volcano[cell as usize].max(height);
+            let mark = HotspotMark {
+                hotspot: index as u32,
+                age_myr: t,
+            };
+            let mut raise = |c: u32, h: f64| {
+                if h > volcano[c as usize] {
+                    volcano[c as usize] = h;
+                    marks[c as usize] = Some(mark);
+                }
+            };
+            raise(cell, height);
             for n in grid.neighbors_of(cell) {
-                volcano[n as usize] = volcano[n as usize].max(VOLCANO_FLANK * height);
+                raise(n, VOLCANO_FLANK * height);
             }
             t += spacing;
         }
     }
-    swell.iter().zip(&volcano).map(|(s, v)| s + v).collect()
+    HotspotRelief {
+        elevation: swell.iter().zip(&volcano).map(|(s, v)| s + v).collect(),
+        marks,
+    }
+}
+
+struct HotspotRelief {
+    elevation: Vec<f64>,
+    marks: Vec<Option<HotspotMark>>,
 }
 
 /// Thickness and elevation for every cell from crust kind, seafloor age and
@@ -531,7 +600,7 @@ mod tests {
             position: plume.to_unit(),
             strength: 1.0,
         }];
-        let r = hotspot_relief(&grid, &cell_plate, &plates, &ocean, &hawaii);
+        let r = hotspot_relief(&grid, &cell_plate, &plates, &ocean, &hawaii).elevation;
 
         // Fresh ocean volcano plus swell at the plume.
         assert!(r[at(0.0, 0.0)] > VOLCANO_OCEAN_M, "{}", r[at(0.0, 0.0)]);
@@ -550,7 +619,7 @@ mod tests {
 
         // On a continent the same plume makes modest relief.
         let land = vec![CrustKind::Continental; grid.len()];
-        let r = hotspot_relief(&grid, &cell_plate, &plates, &land, &hawaii);
+        let r = hotspot_relief(&grid, &cell_plate, &plates, &land, &hawaii).elevation;
         let peak = r.iter().cloned().fold(0.0, f64::max);
         assert!(peak <= VOLCANO_LAND_M + SWELL_M + 1.0, "{peak}");
         // 40 Myr downstream (2,000 km east), the track has all but gone.
@@ -562,9 +631,45 @@ mod tests {
             position: plume.to_unit(),
             strength: 0.2,
         }];
-        let r = hotspot_relief(&grid, &cell_plate, &plates, &ocean, &weak);
+        let r = hotspot_relief(&grid, &cell_plate, &plates, &ocean, &weak).elevation;
         let peak = r.iter().cloned().fold(0.0, f64::max);
         assert!(peak < 0.25 * (VOLCANO_OCEAN_M + SWELL_M), "{peak}");
+    }
+
+    #[test]
+    fn strong_plumes_rise_at_province_edges() {
+        let s = setup();
+        let w = World::generate(&s.grid, &s.edges, 5);
+        let strong: Vec<&Hotspot> = w.hotspots.iter().filter(|h| h.is_strong()).collect();
+        assert_eq!(strong.len(), STRONG_HOTSPOTS);
+        for h in strong {
+            let to_edge = w
+                .mantle
+                .provinces
+                .iter()
+                .map(|p| p.edge_distance(h.position).abs())
+                .fold(f64::MAX, f64::min);
+            assert!(
+                to_edge < 2.0 * PLUME_EDGE_JITTER,
+                "{:.3} rad from an edge",
+                to_edge
+            );
+        }
+        for (h, track) in w.hotspots.iter().zip(&w.hotspot_tracks) {
+            assert!(
+                track[0].abs_diff_eq(h.position, 1e-12),
+                "tracks start at the plume"
+            );
+        }
+        // Volcano records point at real hotspots and plausible ages.
+        let marked: Vec<HotspotMark> = w.hotspot_marks.iter().flatten().copied().collect();
+        assert!(!marked.is_empty());
+        assert!(
+            marked
+                .iter()
+                .all(|m| (m.hotspot as usize) < w.hotspots.len()
+                    && (0.0..=HOTSPOT_TRACK_MYR as f64).contains(&m.age_myr))
+        );
     }
 
     #[test]

@@ -31,6 +31,16 @@
         border-radius: 6px; padding: 3px 10px; cursor: pointer;
       }
       .tray button:hover { background: #2c3347; }
+      /* Performance panel, filled in by web.rs. */
+      #perf {
+        position: fixed; right: 12px; bottom: 12px; width: min(260px, calc(100vw - 24px));
+        font-size: 12px; line-height: 1.4; user-select: none; pointer-events: none;
+      }
+      #perf h2 { margin: 0 0 4px; font-size: 11px; font-weight: 600; letter-spacing: 0.06em; text-transform: uppercase; color: #8a93a6; }
+      #perf dl { display: grid; grid-template-columns: auto 1fr; gap: 1px 10px; margin: 0; font-variant-numeric: tabular-nums; }
+      #perf dt { color: #8a93a6; }
+      #perf dd { margin: 0; text-align: right; }
+      #perf p { margin: 4px 0 0; color: #8a93a6; font-size: 11px; }
       /* Color key, filled in by legend.rs. */
       #legend {
         position: fixed; top: 12px; right: 12px; width: min(240px, calc(100vw - 24px));
@@ -47,16 +57,18 @@
       #legend .row { display: flex; align-items: center; gap: 8px; padding: 1px 0; }
       #legend .swatch { width: 12px; height: 12px; border-radius: 2px; flex: none; }
       #legend .line { width: 16px; height: 3px; border-radius: 2px; flex: none; }
+      #legend .ring { border: 2px solid; border-radius: 50%; box-sizing: border-box; margin: 0 2px; flex: none; }
       #legend .arrow { width: 16px; font-weight: 700; text-align: center; flex: none; }
       #legend .plates { display: grid; grid-template-columns: repeat(3, 1fr); gap: 2px 8px; font-variant-numeric: tabular-nums; }
       #legend .plates i { display: inline-block; width: 10px; height: 10px; margin-right: 5px; border-radius: 2px; vertical-align: -1px; }
       /* On narrow screens the key sits at the bottom so it clears the left panel. */
       @media (max-width: 700px) {
         #legend { top: auto; bottom: 12px; max-height: 40vh; }
+        #perf { bottom: auto; top: 12px; }
       }
       #hud-cursor { font-variant-numeric: tabular-nums; font-weight: 600; }
       #hud-cell { font-variant-numeric: tabular-nums; }
-      #hud-cell:empty, #hud-crust:empty { display: none; }
+      #hud-cell:empty, #hud-crust:empty, #hud-deep:empty { display: none; }
       #hud-crust { font-variant-numeric: tabular-nums; }
       #measure .head { display: flex; align-items: center; justify-content: space-between; margin-bottom: 4px; }
       #measure h2 { margin: 0; font-size: 11px; font-weight: 600; letter-spacing: 0.06em; text-transform: uppercase; color: #8a93a6; }
@@ -82,6 +94,7 @@
         <div id="hud-cursor"></div>
         <div id="hud-cell"></div>
         <div id="hud-crust"></div>
+        <div id="hud-deep"></div>
         <div class="help">
           Drag: move · Wheel: zoom<br />
           Click: measure from a point, click again to finish
@@ -113,17 +126,24 @@
         <label><input type="radio" name="color" id="color-plates" /> Plates</label>
         <label><input type="radio" name="color" id="color-age" /> Seafloor age</label>
         <label><input type="radio" name="color" id="color-crust" /> Crust type and thickness</label>
-        <h2>Overlays</h2>
+        <label><input type="radio" name="color" id="color-mantle" /> Mantle (rising / sinking)</label>
+        <h2>Surface</h2>
         <label><input type="checkbox" id="layer-boundaries" checked /> Plate boundaries</label>
         <label><input type="checkbox" id="layer-motion" /> Plate motion</label>
-        <label><input type="checkbox" id="layer-mantle" /> Mantle flow</label>
         <label><input type="checkbox" id="layer-graticule" checked /> Graticule</label>
+        <h2>Deep earth</h2>
+        <label><input type="checkbox" id="layer-mantle" /> Mantle flow</label>
+        <label><input type="checkbox" id="layer-provinces" /> Deep mantle provinces</label>
+        <label><input type="checkbox" id="layer-hotspots" /> Hotspots</label>
+        <label><input type="checkbox" id="layer-tracks" /> Hotspot tracks</label>
         <h2>Projection</h2>
         <label><input type="radio" name="projection" id="proj-globe" checked /> Globe</label>
         <label><input type="radio" name="projection" id="proj-equirectangular" /> Cylindrical (equirectangular)</label>
         <label><input type="radio" name="projection" id="proj-mercator" /> Cylindrical (Mercator)</label>
         <label><input type="radio" name="projection" id="proj-albers" /> Conic (Albers equal-area)</label>
         <label><input type="radio" name="projection" id="proj-azimuthal" /> Azimuthal (equidistant, both hemispheres)</label>
+        <h2>Diagnostics</h2>
+        <label><input type="checkbox" id="perf-stats" /> Performance stats</label>
         <h2>World</h2>
         <div class="world">
           <span id="world-seed"></span>
@@ -132,6 +152,11 @@
       </div>
     </div>
     <div id="legend" class="card"></div>
+    <div id="perf" class="card" hidden>
+      <h2>Performance</h2>
+      <div id="perf-body"></div>
+      <p>FPS is capped at the display's refresh rate (vsync).</p>
+    </div>
     <div id="error" hidden></div>
   </body>
 </html>

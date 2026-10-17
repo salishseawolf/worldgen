@@ -8,6 +8,8 @@ struct CellData {
     // Seafloor age (Myr), or negative for continental crust.
     age_myr: f32,
     thickness_km: f32,
+    // Elevation from vertical mantle flow (m).
+    dynamic_m: f32,
 };
 
 @group(1) @binding(0) var<storage, read> cells: array<CellData>;
@@ -24,8 +26,9 @@ const RAMP_LEN: u32 = 12u;
 const ELEVATION_AT: u32 = 0u;
 const AGE_AT: u32 = 12u;
 const THICKNESS_AT: u32 = 24u;
-const NO_AGE_AT: u32 = 36u;
-const OCEANIC_CRUST_AT: u32 = 37u;
+const MANTLE_AT: u32 = 36u;
+const NO_AGE_AT: u32 = 48u;
+const OCEANIC_CRUST_AT: u32 = 49u;
 
 // Color of `value` along the ramp starting at entry `at`, interpolating
 // between stops and clamping at the ends.
@@ -60,6 +63,9 @@ fn surface_albedo(cell: u32) -> vec3<f32> {
                 return palettes[OCEANIC_CRUST_AT].rgb;
             }
             return ramp(THICKNESS_AT, d.thickness_km);
+        }
+        case COLOR_MANTLE: {
+            return ramp(MANTLE_AT, d.dynamic_m);
         }
         default: {
             return plate_color[d.plate].rgb;

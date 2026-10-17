@@ -54,6 +54,16 @@ pub const THICKNESS: &[Stop] = &[
     stop(45.0, 0.70, 0.52, 0.33),
     stop(70.0, 0.40, 0.24, 0.12),
 ];
+/// Dynamic topography (m): blue where sinking mantle drags the surface
+/// down, red where rising mantle lifts it.
+pub const MANTLE: &[Stop] = &[
+    stop(-800.0, 0.13, 0.30, 0.70),
+    stop(-400.0, 0.45, 0.60, 0.85),
+    stop(0.0, 0.80, 0.80, 0.80),
+    stop(400.0, 0.92, 0.58, 0.42),
+    stop(800.0, 0.75, 0.15, 0.10),
+];
+
 /// Oceanic crust in the crust view.
 pub const OCEANIC_CRUST: [f64; 3] = [0.20, 0.36, 0.62];
 
@@ -64,8 +74,9 @@ pub const RAMP_LEN: usize = 12;
 pub const ELEVATION_AT: usize = 0;
 pub const AGE_AT: usize = RAMP_LEN;
 pub const THICKNESS_AT: usize = 2 * RAMP_LEN;
-pub const NO_AGE_AT: usize = 3 * RAMP_LEN;
-pub const OCEANIC_CRUST_AT: usize = 3 * RAMP_LEN + 1;
+pub const MANTLE_AT: usize = 3 * RAMP_LEN;
+pub const NO_AGE_AT: usize = 4 * RAMP_LEN;
+pub const OCEANIC_CRUST_AT: usize = 4 * RAMP_LEN + 1;
 
 /// All ramps and fixed colors as `[r, g, b, value]` in linear RGB, for the
 /// shader.
@@ -79,6 +90,7 @@ pub fn gpu_table() -> Vec<[f32; 4]> {
         (ELEVATION_AT, ELEVATION),
         (AGE_AT, AGE),
         (THICKNESS_AT, THICKNESS),
+        (MANTLE_AT, MANTLE),
     ] {
         assert!(ramp.len() <= RAMP_LEN);
         let last = ramp[ramp.len() - 1];
@@ -125,7 +137,7 @@ mod tests {
 
     #[test]
     fn ramps_ascend() {
-        for ramp in [ELEVATION, AGE, THICKNESS] {
+        for ramp in [ELEVATION, AGE, THICKNESS, MANTLE] {
             assert!(ramp.windows(2).all(|w| w[0].value < w[1].value));
         }
     }
@@ -146,6 +158,7 @@ mod tests {
             ("ELEVATION_AT", ELEVATION_AT),
             ("AGE_AT", AGE_AT),
             ("THICKNESS_AT", THICKNESS_AT),
+            ("MANTLE_AT", MANTLE_AT),
             ("NO_AGE_AT", NO_AGE_AT),
             ("OCEANIC_CRUST_AT", OCEANIC_CRUST_AT),
             ("RAMP_LEN", RAMP_LEN),

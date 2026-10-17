@@ -4,11 +4,14 @@
 use std::fmt::Write;
 
 use crate::palette::{self, Stop};
-use crate::scene::{ARROW_DEG_PER_CM_YEAR, MANTLE_FLOW_COLOR, PLATE_MOTION_COLOR, boundary_color};
+use crate::scene::{
+    ARROW_DEG_PER_CM_YEAR, HOTSPOT_COLOR, MANTLE_FLOW_COLOR, PLATE_MOTION_COLOR, PROVINCE_COLOR,
+    TRACK_TICK_MYR, boundary_color,
+};
 use crate::tectonics::BoundaryKind;
 use crate::view::{
-    COLOR_AGE, COLOR_CRUST, COLOR_ELEVATION, COLOR_PLATES, LAYER_BOUNDARIES, LAYER_GRATICULE,
-    LAYER_MANTLE, LAYER_MOTION,
+    COLOR_AGE, COLOR_CRUST, COLOR_ELEVATION, COLOR_MANTLE, COLOR_PLATES, LAYER_BOUNDARIES,
+    LAYER_GRATICULE, LAYER_HOTSPOTS, LAYER_MANTLE, LAYER_MOTION, LAYER_PROVINCES, LAYER_TRACKS,
 };
 
 /// What the key shows for one plate.
@@ -60,6 +63,20 @@ pub fn html(color_mode: u32, layers: u32, plates: &[PlateKey]) -> String {
                 |v| format!("{v:.0} km"),
             );
         }
+        COLOR_MANTLE => {
+            out += "<h2>Mantle (rising / sinking)</h2>";
+            out += &ramp(
+                palette::MANTLE,
+                -800.0,
+                800.0,
+                &[-800.0, -400.0, 0.0, 400.0, 800.0],
+                false,
+                |v| format!("{} m", signed(v)),
+            );
+            out += "<p>How far vertical mantle flow lifts the surface (red, over \
+                    rising mantle) or drags it down (blue, over sinking mantle and \
+                    slabs under trenches).</p>";
+        }
         COLOR_PLATES => {
             out += "<h2>Plates</h2><p>Plate number and mean speed (cm/yr).</p>";
             out += "<div class=\"plates\">";
@@ -105,6 +122,31 @@ pub fn html(color_mode: u32, layers: u32, plates: &[PlateKey]) -> String {
         out += "<h2>Mantle flow</h2>";
         out += &arrow(&rgba_css(MANTLE_FLOW_COLOR), "Convection under the plates");
         out += &arrow_note;
+    }
+    if layers & LAYER_PROVINCES != 0 {
+        out += "<h2>Deep mantle provinces</h2>";
+        out += &line(
+            &rgba_css(PROVINCE_COLOR),
+            "Hot regions at the base of the mantle",
+        );
+        out += "<p>Strong plumes rise from their edges.</p>";
+    }
+    if layers & LAYER_HOTSPOTS != 0 {
+        out += "<h2>Hotspots</h2>";
+        let css = rgba_css(HOTSPOT_COLOR);
+        out += &ring(&css, 14, 1.0, "Strong plume (deep, Hawaii-like)");
+        out += &ring(&css, 8, 0.55, "Weak plume");
+    }
+    if layers & LAYER_TRACKS != 0 {
+        out += "<h2>Hotspot tracks</h2>";
+        out += &line(
+            &rgba_css(HOTSPOT_COLOR),
+            "Volcanoes carried away from the plume",
+        );
+        let _ = write!(
+            out,
+            "<p>Ticks every {TRACK_TICK_MYR} Myr of age; fainter for weak plumes.</p>"
+        );
     }
     if layers & LAYER_GRATICULE != 0 {
         out += "<h2>Graticule</h2>";
@@ -159,6 +201,13 @@ fn line(css: &str, label: &str) -> String {
     format!("<div class=\"row\"><i class=\"line\" style=\"background:{css}\"></i>{label}</div>")
 }
 
+fn ring(css: &str, size_px: u32, opacity: f32, label: &str) -> String {
+    format!(
+        "<div class=\"row\"><i class=\"ring\" style=\"width:{size_px}px;height:{size_px}px;\
+         border-color:{css};opacity:{opacity}\"></i>{label}</div>"
+    )
+}
+
 fn arrow(css: &str, label: &str) -> String {
     format!("<div class=\"row\"><b class=\"arrow\" style=\"color:{css}\">→</b>{label}</div>")
 }
@@ -193,6 +242,18 @@ mod tests {
         assert!(!h.contains("Plate motion"));
         // Elevation can run past the bar's ends.
         assert!(h.contains("\u{2264}\u{2212}8 km") && h.contains("\u{2265}+8 km"));
+    }
+
+    #[test]
+    fn deep_earth_layers() {
+        let h = html(
+            COLOR_MANTLE,
+            LAYER_PROVINCES | LAYER_HOTSPOTS | LAYER_TRACKS,
+            &[],
+        );
+        assert!(h.contains("Mantle (rising / sinking)") && h.contains("+800 m"));
+        assert!(h.contains("Deep mantle provinces") && h.contains("Strong plume"));
+        assert!(h.contains("Ticks every 10 Myr"));
     }
 
     #[test]

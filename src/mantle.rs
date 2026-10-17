@@ -8,23 +8,39 @@
 //! their motion as toroidal (Lithgow-Bertelloni & Richards 1998), which is
 //! the default split here.
 //!
+//! The layout follows Earth's deep mantle, whose structure is dominated by
+//! two huge, hot regions at its base, under Africa and the Pacific, roughly
+//! opposite each other (the large low-shear-velocity provinces), with a
+//! ring of sinking slabs between them around the Pacific. Each province
+//! feeds a broad upwelling; downwellings sit along the ring between.
+//!
 //! Velocities are in radians per million years on the unit sphere; see
 //! [`CM_PER_YEAR`].
 
 use glam::DVec3;
 
-use crate::geo::EARTH_RADIUS_M;
+use std::f64::consts::TAU;
+
+use crate::geo::{EARTH_RADIUS_M, LonLat};
 use crate::grid::Grid;
 use crate::rng::Pcg32;
 
 /// One cm/yr of surface speed, in radians per million years.
 pub const CM_PER_YEAR: f64 = 1e4 / EARTH_RADIUS_M;
 
-const UPWELLINGS: usize = 5;
 const DOWNWELLINGS: usize = 8;
 const VORTICES: usize = 6;
-/// Angular widths (radians): broad upwellings, narrower downwellings.
-const UPWELLING_WIDTH: f64 = 0.6;
+/// Deep provinces: angular radius range (radians, about 2,900 to 3,800 km)
+/// and how far the second strays from exactly opposite the first.
+const PROVINCE_RADIUS: (f64, f64) = (0.45, 0.6);
+const PROVINCE_OFFSET: f64 = 0.3;
+/// Outline irregularity: relative amplitude of the 2- and 3-lobed wobbles.
+const PROVINCE_WOBBLE: f64 = 0.12;
+/// Downwellings sit within this angle (radians) of the ring halfway between
+/// the provinces, and are spread around it with this much angular jitter.
+const RING_SPREAD: f64 = 0.25;
+const RING_JITTER: f64 = 0.3;
+/// Angular widths (radians): narrower downwellings, broad swirls.
 const DOWNWELLING_WIDTH: f64 = 0.35;
 const VORTEX_WIDTH: f64 = 0.5;
 /// Sinking slabs make narrow downwellings under trenches.
@@ -82,7 +98,69 @@ impl Feature {
     }
 }
 
+/// A hot, dense region at the base of the mantle, seen from above: a rough
+/// cap around `center`. Its edges are where deep plumes tend to rise
+/// ("plume generation zones", Burke, Torsvik and colleagues).
+#[derive(Clone, Copy, Debug)]
+pub struct Province {
+    pub center: DVec3,
+    /// Mean angular radius (radians).
+    pub radius: f64,
+    /// (relative amplitude, phase) of 2- and 3-lobed outline wobbles.
+    wobble: [(f64, f64); 2],
+}
+
+impl Province {
+    fn random(center: DVec3, rng: &mut Pcg32) -> Self {
+        let radius = rng.range(PROVINCE_RADIUS.0, PROVINCE_RADIUS.1);
+        let mut wobble = || (rng.range(0.0, PROVINCE_WOBBLE), rng.range(0.0, TAU));
+        let wobble = [wobble(), wobble()];
+        Self {
+            center,
+            radius,
+            wobble,
+        }
+    }
+
+    /// Unit vectors pointing north and east at the center.
+    fn basis(&self) -> (DVec3, DVec3) {
+        let (east, north) = LonLat::from_vec(self.center).east_north();
+        (north, east)
+    }
+
+    /// Angular radius toward `azimuth` (radians clockwise from north).
+    pub fn radius_toward(&self, azimuth: f64) -> f64 {
+        let [(a2, p2), (a3, p3)] = self.wobble;
+        self.radius * (1.0 + a2 * (2.0 * azimuth + p2).sin() + a3 * (3.0 * azimuth + p3).sin())
+    }
+
+    /// The point on the outline toward `azimuth`.
+    pub fn edge_point(&self, azimuth: f64) -> DVec3 {
+        let (north, east) = self.basis();
+        let dir = north * azimuth.cos() + east * azimuth.sin();
+        let r = self.radius_toward(azimuth);
+        self.center * r.cos() + dir * r.sin()
+    }
+
+    /// Angular distance (radians) from `p` to the outline, negative inside.
+    pub fn edge_distance(&self, p: DVec3) -> f64 {
+        let (north, east) = self.basis();
+        let toward = p - self.center * self.center.dot(p);
+        let azimuth = toward.dot(east).atan2(toward.dot(north));
+        p.angle_between(self.center) - self.radius_toward(azimuth)
+    }
+
+    /// `points` points around the outline.
+    pub fn outline(&self, points: usize) -> Vec<DVec3> {
+        (0..points)
+            .map(|i| self.edge_point(TAU * i as f64 / points as f64))
+            .collect()
+    }
+}
+
 pub struct MantleFlow {
+    /// The two deep provinces.
+    pub provinces: Vec<Province>,
     /// Positive strength wells up and spreads out; negative sinks.
     pub sources: Vec<Feature>,
     /// Positive strength turns counterclockwise seen from outside.
@@ -92,17 +170,40 @@ pub struct MantleFlow {
 }
 
 impl MantleFlow {
-    pub fn random(grid: &Grid, rng: &mut Pcg32) -> Self {
-        let mut feature =
-            |strength: f64, width: f64| Feature::new(rng.unit_vector(), strength, width);
-        let mut sources: Vec<Feature> = (0..UPWELLINGS)
-            .map(|_| feature(1.0, UPWELLING_WIDTH))
+    /// Earth-like layout: two roughly opposite deep provinces, each with a
+    /// broad upwelling, downwellings around the ring between them, and
+    /// swirls anywhere.
+    pub fn earthlike(grid: &Grid, rng: &mut Pcg32) -> Self {
+        let first = rng.unit_vector();
+        let second = (-first + rng.unit_vector() * PROVINCE_OFFSET).normalize();
+        let provinces = vec![Province::random(first, rng), Province::random(second, rng)];
+        let mut sources: Vec<Feature> = provinces
+            .iter()
+            .map(|p| Feature::new(p.center, 1.0, p.radius))
             .collect();
-        sources.extend((0..DOWNWELLINGS).map(|_| feature(-1.0, DOWNWELLING_WIDTH)));
+
+        // The ring halfway between: perpendicular to the line joining the
+        // provinces.
+        let axis = (provinces[0].center - provinces[1].center).normalize();
+        let u = axis.any_orthonormal_vector();
+        let v = axis.cross(u);
+        for k in 0..DOWNWELLINGS {
+            let around =
+                TAU * k as f64 / DOWNWELLINGS as f64 + rng.range(-RING_JITTER, RING_JITTER);
+            let off = rng.range(-RING_SPREAD, RING_SPREAD);
+            let dir = u * around.cos() + v * around.sin();
+            let at = dir * off.cos() + axis * off.sin();
+            sources.push(Feature::new(at, -1.0, DOWNWELLING_WIDTH));
+        }
+
         let vortices = (0..VORTICES)
-            .map(|i| feature(if i % 2 == 0 { 1.0 } else { -1.0 }, VORTEX_WIDTH))
+            .map(|i| {
+                let spin = if i % 2 == 0 { 1.0 } else { -1.0 };
+                Feature::new(rng.unit_vector(), spin, VORTEX_WIDTH)
+            })
             .collect();
         let mut flow = Self {
+            provinces,
             sources,
             vortices,
             poloidal_scale: 1.0,
@@ -153,14 +254,29 @@ impl MantleFlow {
     /// [`TOROIDAL_FRACTION`] of the energy. Grid cells are close enough to
     /// equal-area for the RMS to be a plain mean over cells.
     pub fn normalize(&mut self, grid: &Grid) {
-        let rms = |f: &dyn Fn(DVec3) -> DVec3| {
-            let sum: f64 = grid.centers.iter().map(|&p| f(p).length_squared()).sum();
+        self.normalize_and_sample(grid);
+    }
+
+    /// [`normalize`](Self::normalize), returning the velocity at every
+    /// cell as [`sample`](Self::sample) would. Evaluating the features is
+    /// the costly part, so this does it once for both.
+    pub fn normalize_and_sample(&mut self, grid: &Grid) -> Vec<DVec3> {
+        let parts: Vec<(DVec3, DVec3)> = grid
+            .centers
+            .iter()
+            .map(|&p| (self.poloidal(p), self.toroidal(p)))
+            .collect();
+        let rms = |pick: fn(&(DVec3, DVec3)) -> DVec3| {
+            let sum: f64 = parts.iter().map(|x| pick(x).length_squared()).sum();
             (sum / grid.len() as f64).sqrt().max(1e-12)
         };
         let target = RMS_CM_YEAR * CM_PER_YEAR;
-        self.poloidal_scale =
-            target * (1.0 - TOROIDAL_FRACTION).sqrt() / rms(&|p| self.poloidal(p));
-        self.toroidal_scale = target * TOROIDAL_FRACTION.sqrt() / rms(&|p| self.toroidal(p));
+        self.poloidal_scale = target * (1.0 - TOROIDAL_FRACTION).sqrt() / rms(|x| x.0);
+        self.toroidal_scale = target * TOROIDAL_FRACTION.sqrt() / rms(|x| x.1);
+        parts
+            .iter()
+            .map(|(pol, tor)| *pol * self.poloidal_scale + *tor * self.toroidal_scale)
+            .collect()
     }
 }
 
@@ -172,7 +288,7 @@ mod tests {
     #[test]
     fn flow_is_tangent_with_target_speed_and_split() {
         let grid = Grid::new(Resolution::Two);
-        let flow = MantleFlow::random(&grid, &mut Pcg32::new(3));
+        let flow = MantleFlow::earthlike(&grid, &mut Pcg32::new(3));
         let mut total = 0.0;
         let mut toroidal = 0.0;
         for &p in &grid.centers {
@@ -189,8 +305,37 @@ mod tests {
     }
 
     #[test]
+    fn earthlike_layout() {
+        let grid = Grid::new(Resolution::Two);
+        for seed in 0..10 {
+            let flow = MantleFlow::earthlike(&grid, &mut Pcg32::new(seed));
+            let [a, b] = [flow.provinces[0], flow.provinces[1]];
+            // Roughly opposite each other.
+            let apart = a.center.angle_between(b.center).to_degrees();
+            assert!(apart > 150.0, "seed {seed}: {apart:.0}°");
+            // Rising over each province, sinking on the ring between.
+            assert!(flow.upwelling(a.center) > 0.5 && flow.upwelling(b.center) > 0.5);
+            let axis = (a.center - b.center).normalize();
+            for f in flow.sources.iter().filter(|f| f.strength < 0.0) {
+                assert!(f.center.dot(axis).abs() < RING_SPREAD.sin() + 1e-9);
+            }
+        }
+    }
+
+    #[test]
+    fn province_outline_and_edge_distance() {
+        let p = Province::random(DVec3::Y, &mut Pcg32::new(1));
+        for &q in &p.outline(36) {
+            assert!(p.edge_distance(q).abs() < 1e-9, "outline lies on the edge");
+        }
+        assert!(p.edge_distance(DVec3::Y) < 0.0, "center is inside");
+        assert!(p.edge_distance(-DVec3::Y) > 0.0, "antipode is outside");
+    }
+
+    #[test]
     fn upwelling_rises_and_downwelling_sinks() {
         let flow = MantleFlow {
+            provinces: vec![],
             sources: vec![
                 Feature::new(DVec3::Y, 1.0, 0.5),
                 Feature::new(-DVec3::Y, -1.0, 0.5),
@@ -210,6 +355,7 @@ mod tests {
         let center = DVec3::Y;
         let near = DVec3::new(0.2, 1.0, 0.0).normalize();
         let up = MantleFlow {
+            provinces: vec![],
             sources: vec![Feature::new(center, 1.0, 0.5)],
             vortices: vec![],
             poloidal_scale: 1.0,
