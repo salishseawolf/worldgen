@@ -1,0 +1,37 @@
+[tools]
+rust = { version = "1.99.0", targets = "wasm32-unknown-unknown", components = "clippy,rustfmt" }
+"github:trunk-rs/trunk" = "0.21.14"
+
+[env]
+IMAGE = "localhost/worldgen:dev"
+
+[tasks.dev]
+description = "Serve with hot reload on http://localhost:8080"
+run = "trunk serve --port 8080"
+
+[tasks.build]
+description = "Release build into dist/"
+run = "trunk build --release"
+
+[tasks.check]
+description = "Format check and clippy on the wasm target"
+run = [
+  "cargo fmt --check",
+  "cargo clippy --target wasm32-unknown-unknown -- -D warnings",
+]
+
+[tasks.fmt]
+description = "Format the code"
+run = "cargo fmt"
+
+[tasks."container:build"]
+description = "Build the container image"
+run = "podman build -t $IMAGE -f Containerfile ."
+
+[tasks."container:run"]
+description = "Run the container on http://localhost:8080"
+run = "podman run --rm -p 8080:8080 $IMAGE"
+
+[tasks.test]
+description = "Run native unit tests"
+run = "cargo test"

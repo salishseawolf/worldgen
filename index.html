@@ -1,0 +1,18 @@
+<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="utf-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1" />
+    <title>worldgen</title>
+    <link data-trunk rel="rust" data-wasm-opt="s" />
+    <style>
+      html, body { margin: 0; height: 100%; background: #0b0d12; color: #ddd; font-family: system-ui, sans-serif; }
+      #world { display: block; width: 100vw; height: 100vh; }
+      #error { position: fixed; inset: 0; display: grid; place-items: center; padding: 2rem; text-align: center; }
+    </style>
+  </head>
+  <body>
+    <canvas id="world"></canvas>
+    <div id="error" hidden></div>
+  </body>
+</html>

@@ -1,0 +1,23 @@
+[package]
+name = "worldgen"
+version = "0.1.0"
+edition = "2024"
+
+[lib]
+crate-type = ["cdylib", "rlib"]
+
+[dependencies]
+bytemuck = { version = "1.25", features = ["derive"] }
+console_error_panic_hook = "0.1.7"
+console_log = "1.1"
+glam = { version = "0.34", features = ["bytemuck"] }
+js-sys = "0.3.106"
+log = "0.4"
+wasm-bindgen = "0.2.129"
+wasm-bindgen-futures = "0.4.79"
+web-sys = { version = "0.3.106", features = ["Document", "Element", "HtmlCanvasElement", "Navigator", "Window"] }
+wgpu = { version = "30.0", default-features = false, features = ["webgpu", "wgsl"] }
+
+[profile.release]
+opt-level = "s"
+lto = true
