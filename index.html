@@ -6,13 +6,35 @@
     <title>worldgen</title>
     <link data-trunk rel="rust" data-wasm-opt="s" />
     <style>
-      html, body { margin: 0; height: 100%; background: #0b0d12; color: #ddd; font-family: system-ui, sans-serif; }
-      #world { display: block; width: 100vw; height: 100vh; }
+      html, body { margin: 0; height: 100%; overflow: hidden; background: #0b0d12; color: #ddd; font-family: system-ui, sans-serif; }
+      #world { display: block; width: 100vw; height: 100vh; touch-action: none; cursor: crosshair; }
       #error { position: fixed; inset: 0; display: grid; place-items: center; padding: 2rem; text-align: center; }
+      /* display: grid above beats the UA's [hidden] rule; without this the
+         empty overlay covers the canvas and swallows all pointer events. */
+      #error[hidden] { display: none; }
+      #hud {
+        position: fixed; top: 12px; left: 12px; max-width: min(320px, calc(100vw - 24px));
+        padding: 10px 12px; border-radius: 8px; background: rgba(10, 12, 18, 0.75);
+        font-size: 13px; line-height: 1.45; pointer-events: none; user-select: none;
+      }
+      #hud-cursor { font-variant-numeric: tabular-nums; font-weight: 600; }
+      #hud-polygons { margin: 6px 0; padding-left: 18px; }
+      #hud-polygons:empty { display: none; }
+      #hud-polygons .drawing { color: #4de6ff; }
+      #hud .help { color: #8a93a6; font-size: 12px; }
     </style>
   </head>
   <body>
     <canvas id="world"></canvas>
+    <div id="hud">
+      <div id="hud-cursor"></div>
+      <ul id="hud-polygons"></ul>
+      <div class="help">
+        Drag: rotate · Wheel: zoom<br />
+        Click: add vertex · Double-click / Enter: close<br />
+        Backspace: undo vertex · Esc: cancel
+      </div>
+    </div>
     <div id="error" hidden></div>
   </body>
 </html>

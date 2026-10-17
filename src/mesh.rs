@@ -95,6 +95,47 @@ pub fn icosphere(subdivisions: u32) -> Mesh {
     }
 }
 
+/// Unit cylinder around +Y with radius 1, from slightly below 0 (so it sinks
+/// into the surface instead of floating over globe facets) up to 1, with a
+/// top cap. The bottom is never visible, so it stays open.
+pub fn cylinder(sides: u32) -> Mesh {
+    const BOTTOM: f32 = -0.05;
+    let mut vertices = Vec::new();
+    let mut indices = Vec::new();
+    for i in 0..sides {
+        let angle = |k: u32| k as f32 / sides as f32 * std::f32::consts::TAU;
+        let (s0, c0) = angle(i).sin_cos();
+        let (s1, c1) = angle(i + 1).sin_cos();
+        let base = vertices.len() as u32;
+        for (x, z) in [(c0, s0), (c1, s1)] {
+            vertices.push(Vertex {
+                position: [x, BOTTOM, z],
+                normal: [x, 0.0, z],
+            });
+            vertices.push(Vertex {
+                position: [x, 1.0, z],
+                normal: [x, 0.0, z],
+            });
+        }
+        indices.extend([base, base + 1, base + 3, base, base + 3, base + 2]);
+        let cap = vertices.len() as u32;
+        vertices.push(Vertex {
+            position: [0.0, 1.0, 0.0],
+            normal: [0.0, 1.0, 0.0],
+        });
+        vertices.push(Vertex {
+            position: [c0, 1.0, s0],
+            normal: [0.0, 1.0, 0.0],
+        });
+        vertices.push(Vertex {
+            position: [c1, 1.0, s1],
+            normal: [0.0, 1.0, 0.0],
+        });
+        indices.extend([cap, cap + 2, cap + 1]);
+    }
+    Mesh { vertices, indices }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

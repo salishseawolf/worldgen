@@ -1,12 +1,96 @@
-use glam::Mat4;
 use web_sys::HtmlCanvasElement;
 use wgpu::util::DeviceExt;
 
-use crate::camera::Camera;
-use crate::mesh::{Vertex, icosphere};
+use crate::mesh::{Mesh, Vertex, cylinder, icosphere};
+use crate::scene::{Column, Scene, Segment};
 
 const DEPTH_FORMAT: wgpu::TextureFormat = wgpu::TextureFormat::Depth32Float;
-const SPHERE_SUBDIVISIONS: u32 = 5;
+const GLOBE_SUBDIVISIONS: u32 = 6;
+const COLUMN_SIDES: u32 = 16;
+
+#[repr(C)]
+#[derive(Clone, Copy, bytemuck::Pod, bytemuck::Zeroable)]
+pub struct Globals {
+    pub view_proj: [[f32; 4]; 4],
+    pub light_dir: [f32; 4],
+    /// Viewport width and height (physical px), planet radius (m), line width (px).
+    pub params: [f32; 4],
+}
+
+macro_rules! shader {
+    ($device:expr, $file:literal) => {
+        $device.create_shader_module(wgpu::ShaderModuleDescriptor {
+            label: Some($file),
+            source: wgpu::ShaderSource::Wgsl(
+                concat!(
+                    include_str!("shaders/common.wgsl"),
+                    include_str!(concat!("shaders/", $file))
+                )
+                .into(),
+            ),
+        })
+    };
+}
+
+struct GpuMesh {
+    vertices: wgpu::Buffer,
+    indices: wgpu::Buffer,
+    index_count: u32,
+}
+
+impl GpuMesh {
+    fn new(device: &wgpu::Device, label: &str, mesh: &Mesh) -> Self {
+        Self {
+            vertices: device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
+                label: Some(label),
+                contents: bytemuck::cast_slice(&mesh.vertices),
+                usage: wgpu::BufferUsages::VERTEX,
+            }),
+            indices: device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
+                label: Some(label),
+                contents: bytemuck::cast_slice(&mesh.indices),
+                usage: wgpu::BufferUsages::INDEX,
+            }),
+            index_count: mesh.indices.len() as u32,
+        }
+    }
+}
+
+/// Per-frame instance data in a vertex buffer that grows as needed.
+struct InstanceBuffer {
+    label: &'static str,
+    buffer: wgpu::Buffer,
+    count: u32,
+}
+
+impl InstanceBuffer {
+    fn new(device: &wgpu::Device, label: &'static str) -> Self {
+        Self {
+            label,
+            buffer: Self::allocate(device, label, 4096),
+            count: 0,
+        }
+    }
+
+    fn allocate(device: &wgpu::Device, label: &str, size: u64) -> wgpu::Buffer {
+        device.create_buffer(&wgpu::BufferDescriptor {
+            label: Some(label),
+            size,
+            usage: wgpu::BufferUsages::VERTEX | wgpu::BufferUsages::COPY_DST,
+            mapped_at_creation: false,
+        })
+    }
+
+    fn write<T: bytemuck::Pod>(&mut self, device: &wgpu::Device, queue: &wgpu::Queue, data: &[T]) {
+        let bytes: &[u8] = bytemuck::cast_slice(data);
+        if bytes.len() as u64 > self.buffer.size() {
+            let size = (bytes.len() as u64).next_power_of_two();
+            self.buffer = Self::allocate(device, self.label, size);
+        }
+        queue.write_buffer(&self.buffer, 0, bytes);
+        self.count = data.len() as u32;
+    }
+}
 
 pub struct Renderer {
     canvas: HtmlCanvasElement,
@@ -14,14 +98,16 @@ pub struct Renderer {
     device: wgpu::Device,
     queue: wgpu::Queue,
     config: wgpu::SurfaceConfiguration,
-    pipeline: wgpu::RenderPipeline,
-    vertex_buffer: wgpu::Buffer,
-    index_buffer: wgpu::Buffer,
-    index_count: u32,
-    camera: Camera,
-    camera_buffer: wgpu::Buffer,
-    camera_bind_group: wgpu::BindGroup,
     depth_view: wgpu::TextureView,
+    globals_buffer: wgpu::Buffer,
+    globals_bind_group: wgpu::BindGroup,
+    globe_pipeline: wgpu::RenderPipeline,
+    globe: GpuMesh,
+    column_pipeline: wgpu::RenderPipeline,
+    column_mesh: GpuMesh,
+    columns: InstanceBuffer,
+    line_pipeline: wgpu::RenderPipeline,
+    segments: InstanceBuffer,
 }
 
 impl Renderer {
@@ -67,26 +153,14 @@ impl Renderer {
         };
         surface.configure(&device, &config);
 
-        let mesh = icosphere(SPHERE_SUBDIVISIONS);
-        let vertex_buffer = device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
-            label: Some("sphere vertices"),
-            contents: bytemuck::cast_slice(&mesh.vertices),
-            usage: wgpu::BufferUsages::VERTEX,
-        });
-        let index_buffer = device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
-            label: Some("sphere indices"),
-            contents: bytemuck::cast_slice(&mesh.indices),
-            usage: wgpu::BufferUsages::INDEX,
-        });
-
-        let camera = Camera::new(width as f32 / height as f32);
-        let camera_buffer = device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
-            label: Some("camera"),
-            contents: bytemuck::bytes_of(&camera.uniform(Mat4::IDENTITY)),
+        let globals_buffer = device.create_buffer(&wgpu::BufferDescriptor {
+            label: Some("globals"),
+            size: std::mem::size_of::<Globals>() as u64,
             usage: wgpu::BufferUsages::UNIFORM | wgpu::BufferUsages::COPY_DST,
+            mapped_at_creation: false,
         });
         let bind_group_layout = device.create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor {
-            label: Some("camera"),
+            label: Some("globals"),
             entries: &[wgpu::BindGroupLayoutEntry {
                 binding: 0,
                 visibility: wgpu::ShaderStages::VERTEX_FRAGMENT,
@@ -98,101 +172,117 @@ impl Renderer {
                 count: None,
             }],
         });
-        let camera_bind_group = device.create_bind_group(&wgpu::BindGroupDescriptor {
-            label: Some("camera"),
+        let globals_bind_group = device.create_bind_group(&wgpu::BindGroupDescriptor {
+            label: Some("globals"),
             layout: &bind_group_layout,
             entries: &[wgpu::BindGroupEntry {
                 binding: 0,
-                resource: camera_buffer.as_entire_binding(),
+                resource: globals_buffer.as_entire_binding(),
             }],
         });
-
-        let shader = device.create_shader_module(wgpu::include_wgsl!("shaders/sphere.wgsl"));
         let layout = device.create_pipeline_layout(&wgpu::PipelineLayoutDescriptor {
-            label: Some("sphere"),
+            label: Some("globals"),
             bind_group_layouts: &[Some(&bind_group_layout)],
             immediate_size: 0,
         });
-        let pipeline = device.create_render_pipeline(&wgpu::RenderPipelineDescriptor {
-            label: Some("sphere"),
-            layout: Some(&layout),
-            vertex: wgpu::VertexState {
-                module: &shader,
-                entry_point: Some("vs_main"),
-                compilation_options: Default::default(),
-                buffers: &[Some(wgpu::VertexBufferLayout {
-                    array_stride: std::mem::size_of::<Vertex>() as u64,
-                    step_mode: wgpu::VertexStepMode::Vertex,
-                    attributes: &wgpu::vertex_attr_array![0 => Float32x3, 1 => Float32x3],
-                })],
-            },
-            fragment: Some(wgpu::FragmentState {
-                module: &shader,
-                entry_point: Some("fs_main"),
-                compilation_options: Default::default(),
-                targets: &[Some(wgpu::ColorTargetState {
-                    format,
-                    blend: None,
-                    write_mask: wgpu::ColorWrites::ALL,
-                })],
-            }),
-            primitive: wgpu::PrimitiveState {
-                cull_mode: Some(wgpu::Face::Back),
-                ..Default::default()
-            },
-            depth_stencil: Some(wgpu::DepthStencilState {
-                format: DEPTH_FORMAT,
-                depth_write_enabled: Some(true),
-                depth_compare: Some(wgpu::CompareFunction::Less),
-                stencil: Default::default(),
-                bias: Default::default(),
-            }),
-            multisample: Default::default(),
-            multiview_mask: None,
-            cache: None,
-        });
 
-        let depth_view = create_depth_view(&device, width, height);
+        let mesh_layout = wgpu::VertexBufferLayout {
+            array_stride: std::mem::size_of::<Vertex>() as u64,
+            step_mode: wgpu::VertexStepMode::Vertex,
+            attributes: &wgpu::vertex_attr_array![0 => Float32x3, 1 => Float32x3],
+        };
+
+        let globe_shader = shader!(device, "globe.wgsl");
+        let globe_pipeline = create_pipeline(
+            &device,
+            &layout,
+            "globe",
+            &globe_shader,
+            &[Some(mesh_layout.clone())],
+            format,
+            Some(wgpu::Face::Back),
+            true,
+            None,
+        );
+
+        let column_shader = shader!(device, "columns.wgsl");
+        let column_pipeline = create_pipeline(
+            &device,
+            &layout,
+            "columns",
+            &column_shader,
+            &[
+                Some(mesh_layout),
+                Some(wgpu::VertexBufferLayout {
+                    array_stride: std::mem::size_of::<Column>() as u64,
+                    step_mode: wgpu::VertexStepMode::Instance,
+                    attributes: &wgpu::vertex_attr_array![
+                        2 => Float32x3, 3 => Float32, 4 => Float32x3, 5 => Float32, 6 => Float32x4
+                    ],
+                }),
+            ],
+            format,
+            None,
+            true,
+            None,
+        );
+
+        let line_shader = shader!(device, "lines.wgsl");
+        let line_pipeline = create_pipeline(
+            &device,
+            &layout,
+            "lines",
+            &line_shader,
+            &[Some(wgpu::VertexBufferLayout {
+                array_stride: std::mem::size_of::<Segment>() as u64,
+                step_mode: wgpu::VertexStepMode::Instance,
+                attributes: &wgpu::vertex_attr_array![0 => Float32x3, 1 => Float32x3, 2 => Float32x4],
+            })],
+            format,
+            None,
+            false,
+            Some(wgpu::BlendState::ALPHA_BLENDING),
+        );
 
         Ok(Self {
+            depth_view: create_depth_view(&device, width, height),
+            globe: GpuMesh::new(&device, "globe", &icosphere(GLOBE_SUBDIVISIONS)),
+            column_mesh: GpuMesh::new(&device, "column", &cylinder(COLUMN_SIDES)),
+            columns: InstanceBuffer::new(&device, "column instances"),
+            segments: InstanceBuffer::new(&device, "segment instances"),
             canvas,
             surface,
             device,
             queue,
             config,
-            pipeline,
-            vertex_buffer,
-            index_buffer,
-            index_count: mesh.indices.len() as u32,
-            camera,
-            camera_buffer,
-            camera_bind_group,
-            depth_view,
+            globals_buffer,
+            globals_bind_group,
+            globe_pipeline,
+            column_pipeline,
+            line_pipeline,
         })
     }
 
-    /// Reconfigure the surface if the canvas's displayed size changed.
-    fn sync_size(&mut self) {
+    /// Resize the surface to the canvas's displayed size if it changed, and
+    /// return the size in physical pixels.
+    pub fn sync_size(&mut self) -> (u32, u32) {
         let (width, height) = canvas_size(&self.canvas);
-        if width == self.config.width && height == self.config.height {
-            return;
+        if width != self.config.width || height != self.config.height {
+            self.config.width = width;
+            self.config.height = height;
+            self.surface.configure(&self.device, &self.config);
+            self.depth_view = create_depth_view(&self.device, width, height);
         }
-        self.config.width = width;
-        self.config.height = height;
-        self.surface.configure(&self.device, &self.config);
-        self.depth_view = create_depth_view(&self.device, width, height);
-        self.camera.aspect = width as f32 / height as f32;
+        (width, height)
     }
 
-    pub fn render(&mut self, time_ms: f64) {
-        self.sync_size();
-
-        let model = Mat4::from_rotation_y((time_ms / 1000.0 * 0.4) as f32);
-        self.queue.write_buffer(
-            &self.camera_buffer,
-            0,
-            bytemuck::bytes_of(&self.camera.uniform(model)),
-        );
+    pub fn render(&mut self, globals: &Globals, scene: &Scene) {
+        self.queue
+            .write_buffer(&self.globals_buffer, 0, bytemuck::bytes_of(globals));
+        self.columns
+            .write(&self.device, &self.queue, &scene.columns);
+        self.segments
+            .write(&self.device, &self.queue, &scene.segments);
 
         let frame = match self.surface.get_current_texture() {
             wgpu::CurrentSurfaceTexture::Success(frame)
@@ -207,7 +297,7 @@ impl Renderer {
         let mut encoder = self.device.create_command_encoder(&Default::default());
         {
             let mut pass = encoder.begin_render_pass(&wgpu::RenderPassDescriptor {
-                label: Some("sphere"),
+                label: Some("main"),
                 color_attachments: &[Some(wgpu::RenderPassColorAttachment {
                     view: &view,
                     resolve_target: None,
@@ -234,15 +324,82 @@ impl Renderer {
                 occlusion_query_set: None,
                 multiview_mask: None,
             });
-            pass.set_pipeline(&self.pipeline);
-            pass.set_bind_group(0, &self.camera_bind_group, &[]);
-            pass.set_vertex_buffer(0, self.vertex_buffer.slice(..));
-            pass.set_index_buffer(self.index_buffer.slice(..), wgpu::IndexFormat::Uint32);
-            pass.draw_indexed(0..self.index_count, 0, 0..1);
+            pass.set_bind_group(0, &self.globals_bind_group, &[]);
+
+            pass.set_pipeline(&self.globe_pipeline);
+            pass.set_vertex_buffer(0, self.globe.vertices.slice(..));
+            pass.set_index_buffer(self.globe.indices.slice(..), wgpu::IndexFormat::Uint32);
+            pass.draw_indexed(0..self.globe.index_count, 0, 0..1);
+
+            if self.columns.count > 0 {
+                pass.set_pipeline(&self.column_pipeline);
+                pass.set_vertex_buffer(0, self.column_mesh.vertices.slice(..));
+                pass.set_vertex_buffer(1, self.columns.buffer.slice(..));
+                pass.set_index_buffer(
+                    self.column_mesh.indices.slice(..),
+                    wgpu::IndexFormat::Uint32,
+                );
+                pass.draw_indexed(0..self.column_mesh.index_count, 0, 0..self.columns.count);
+            }
+
+            // Lines last: they test depth but don't write it, and blend.
+            if self.segments.count > 0 {
+                pass.set_pipeline(&self.line_pipeline);
+                pass.set_vertex_buffer(0, self.segments.buffer.slice(..));
+                pass.draw(0..6, 0..self.segments.count);
+            }
         }
         self.queue.submit([encoder.finish()]);
         self.queue.present(frame);
     }
+}
+
+#[allow(clippy::too_many_arguments)]
+fn create_pipeline(
+    device: &wgpu::Device,
+    layout: &wgpu::PipelineLayout,
+    label: &str,
+    shader: &wgpu::ShaderModule,
+    buffers: &[Option<wgpu::VertexBufferLayout>],
+    format: wgpu::TextureFormat,
+    cull_mode: Option<wgpu::Face>,
+    depth_write: bool,
+    blend: Option<wgpu::BlendState>,
+) -> wgpu::RenderPipeline {
+    device.create_render_pipeline(&wgpu::RenderPipelineDescriptor {
+        label: Some(label),
+        layout: Some(layout),
+        vertex: wgpu::VertexState {
+            module: shader,
+            entry_point: Some("vs_main"),
+            compilation_options: Default::default(),
+            buffers,
+        },
+        fragment: Some(wgpu::FragmentState {
+            module: shader,
+            entry_point: Some("fs_main"),
+            compilation_options: Default::default(),
+            targets: &[Some(wgpu::ColorTargetState {
+                format,
+                blend,
+                write_mask: wgpu::ColorWrites::ALL,
+            })],
+        }),
+        primitive: wgpu::PrimitiveState {
+            cull_mode,
+            ..Default::default()
+        },
+        depth_stencil: Some(wgpu::DepthStencilState {
+            format: DEPTH_FORMAT,
+            depth_write_enabled: Some(depth_write),
+            depth_compare: Some(wgpu::CompareFunction::Less),
+            stencil: Default::default(),
+            bias: Default::default(),
+        }),
+        multisample: Default::default(),
+        multiview_mask: None,
+        cache: None,
+    })
 }
 
 /// Canvas size in physical pixels, never zero.
@@ -250,8 +407,11 @@ fn canvas_size(canvas: &HtmlCanvasElement) -> (u32, u32) {
     let dpr = web_sys::window().map_or(1.0, |w| w.device_pixel_ratio());
     let width = ((canvas.client_width() as f64 * dpr) as u32).max(1);
     let height = ((canvas.client_height() as f64 * dpr) as u32).max(1);
-    canvas.set_width(width);
-    canvas.set_height(height);
+    // Assigning the size, even unchanged, can reset the canvas, so only on change.
+    if canvas.width() != width || canvas.height() != height {
+        canvas.set_width(width);
+        canvas.set_height(height);
+    }
     (width, height)
 }
 
