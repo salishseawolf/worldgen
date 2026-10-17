@@ -8,6 +8,7 @@ mod geo;
 mod grid;
 mod mesh;
 mod plates;
+mod projection;
 #[cfg(target_arch = "wasm32")]
 mod renderer;
 mod rng;

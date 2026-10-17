@@ -50,9 +50,12 @@ pub struct Scene {
 }
 
 impl Scene {
-    /// `altitude` scales the column markers so they keep a steady on-screen
-    /// size while zooming.
-    pub fn build(drawing: &Drawing, hover: Option<LonLat>, radius: f64, altitude: f64) -> Self {
+    /// Cursor column width as a fraction of `marker_scale`.
+    pub const CURSOR_WIDTH: f64 = 0.004;
+
+    /// `marker_scale` (meters) sizes the column markers; callers vary it with
+    /// zoom so markers keep a steady on-screen size.
+    pub fn build(drawing: &Drawing, hover: Option<LonLat>, radius: f64, marker_scale: f64) -> Self {
         let mut scene = Scene::default();
 
         for polygon in &drawing.polygons {
@@ -66,7 +69,7 @@ impl Scene {
             scene.add_path(&[last, h.to_unit()], false, radius, RUBBER_BAND_COLOR);
         }
 
-        let marker = altitude.min(radius);
+        let marker = marker_scale;
         for &p in &current {
             scene.add_column(p, radius, marker * 0.02, marker * 0.003, VERTEX_COLOR);
         }
@@ -75,7 +78,7 @@ impl Scene {
                 h.to_unit(),
                 radius,
                 marker * 0.12,
-                marker * 0.004,
+                marker * Self::CURSOR_WIDTH,
                 CURSOR_COLOR,
             );
         }

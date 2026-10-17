@@ -40,7 +40,7 @@ impl OrbitCamera {
     }
 
     /// Unit vector from the planet center toward the eye.
-    fn eye_dir(&self) -> DVec3 {
+    pub fn eye_dir(&self) -> DVec3 {
         DVec3::new(
             self.pitch.cos() * self.yaw.sin(),
             self.pitch.sin(),
@@ -116,7 +116,7 @@ impl OrbitCamera {
         ray_sphere(&self.ray(ndc_x, ndc_y), self.radius).map(DVec3::normalize)
     }
 
-    fn set_eye_dir(&mut self, d: DVec3) {
+    pub fn set_eye_dir(&mut self, d: DVec3) {
         self.yaw = d.x.atan2(d.z);
         self.pitch = d.y.clamp(-1.0, 1.0).asin().clamp(-MAX_PITCH, MAX_PITCH);
     }

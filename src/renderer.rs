@@ -4,10 +4,14 @@ use wgpu::util::DeviceExt;
 use crate::grid::Grid;
 use crate::mesh::{CellVertex, Vertex, cell_mesh, cylinder};
 use crate::plates::Plates;
+use crate::projection::Projection;
 use crate::scene::{Column, Scene, Segment};
 
 const DEPTH_FORMAT: wgpu::TextureFormat = wgpu::TextureFormat::Depth32Float;
 const COLUMN_SIDES: u32 = 16;
+/// Cell-id cube map face size. Cells at resolution 3 span about 70 texels.
+const CELL_MAP_SIZE: u32 = 1024;
+const CELL_MAP_FORMAT: wgpu::TextureFormat = wgpu::TextureFormat::R32Uint;
 
 /// Bits of `Globals::layers[0]`; must match common.wgsl.
 pub const LAYER_PLATES: u32 = 1;
@@ -21,18 +25,24 @@ pub struct Globals {
     pub light_dir: [f32; 4],
     /// Viewport width and height (physical px), planet radius (m), line width (px).
     pub params: [f32; 4],
-    /// Bitmask of visible `LAYER_*` flags, then unused.
-    pub layers: [u32; 4],
+    /// Bitmask of visible `LAYER_*` flags, projection id, then unused.
+    pub flags: [u32; 4],
+    /// Flat maps: `MapProjection::params`.
+    pub projection: [f32; 4],
+    /// Flat maps: map point at the screen center, map units to the top
+    /// edge, aspect.
+    pub map: [f32; 4],
 }
 
+/// Builds a shader from common.wgsl, any shared snippets, then the file.
 macro_rules! shader {
-    ($device:expr, $file:literal) => {
+    ($device:expr, $($file:literal),+) => {
         $device.create_shader_module(wgpu::ShaderModuleDescriptor {
-            label: Some($file),
+            label: Some(concat!($($file, " "),+)),
             source: wgpu::ShaderSource::Wgsl(
                 concat!(
                     include_str!("shaders/common.wgsl"),
-                    include_str!(concat!("shaders/", $file))
+                    $(include_str!(concat!("shaders/", $file))),+
                 )
                 .into(),
             ),
@@ -116,6 +126,8 @@ pub struct Renderer {
     globals_bind_group: wgpu::BindGroup,
     globe_pipeline: wgpu::RenderPipeline,
     globe: GpuMesh,
+    map_pipeline: wgpu::RenderPipeline,
+    cell_map: wgpu::TextureView,
     plate_layout: wgpu::BindGroupLayout,
     plate_bind_group: wgpu::BindGroup,
     plate_boundaries: InstanceBuffer,
@@ -219,7 +231,20 @@ impl Renderer {
         };
         let plate_layout = device.create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor {
             label: Some("plates"),
-            entries: &[storage_entry(0), storage_entry(1)],
+            entries: &[
+                storage_entry(0),
+                storage_entry(1),
+                wgpu::BindGroupLayoutEntry {
+                    binding: 2,
+                    visibility: wgpu::ShaderStages::FRAGMENT,
+                    ty: wgpu::BindingType::Texture {
+                        sample_type: wgpu::TextureSampleType::Uint,
+                        view_dimension: wgpu::TextureViewDimension::D2Array,
+                        multisampled: false,
+                    },
+                    count: None,
+                },
+            ],
         });
         let globe_layout = device.create_pipeline_layout(&wgpu::PipelineLayoutDescriptor {
             label: Some("globe"),
@@ -233,20 +258,34 @@ impl Renderer {
             attributes: &wgpu::vertex_attr_array![0 => Float32x3, 1 => Float32x3],
         };
 
-        let globe_shader = shader!(device, "globe.wgsl");
+        let cell_vertex_layout = wgpu::VertexBufferLayout {
+            array_stride: std::mem::size_of::<CellVertex>() as u64,
+            step_mode: wgpu::VertexStepMode::Vertex,
+            attributes: &wgpu::vertex_attr_array![0 => Float32x3, 1 => Uint32],
+        };
+        let globe_shader = shader!(device, "surface.wgsl", "globe.wgsl");
         let globe_pipeline = create_pipeline(
             &device,
             &globe_layout,
             "globe",
             &globe_shader,
-            &[Some(wgpu::VertexBufferLayout {
-                array_stride: std::mem::size_of::<CellVertex>() as u64,
-                step_mode: wgpu::VertexStepMode::Vertex,
-                attributes: &wgpu::vertex_attr_array![0 => Float32x3, 1 => Uint32],
-            })],
+            &[Some(cell_vertex_layout.clone())],
             format,
             Some(wgpu::Face::Back),
             true,
+            None,
+        );
+
+        let map_shader = shader!(device, "surface.wgsl", "map.wgsl");
+        let map_pipeline = create_pipeline(
+            &device,
+            &globe_layout,
+            "map",
+            &map_shader,
+            &[],
+            format,
+            None,
+            false,
             None,
         );
 
@@ -290,13 +329,17 @@ impl Renderer {
         );
 
         let (globe_vertices, globe_indices) = cell_mesh(grid);
+        let globe = GpuMesh::new(&device, "globe", &globe_vertices, &globe_indices);
+        let cell_map = bake_cell_map(&device, &queue, &globe, cell_vertex_layout);
         let column = cylinder(COLUMN_SIDES);
         let mut plate_boundaries = InstanceBuffer::new(&device, "plate boundaries");
         plate_boundaries.write(&device, &queue, boundaries);
         Ok(Self {
             depth_view: create_depth_view(&device, width, height),
-            globe: GpuMesh::new(&device, "globe", &globe_vertices, &globe_indices),
-            plate_bind_group: create_plate_bind_group(&device, &plate_layout, plates),
+            globe,
+            plate_bind_group: create_plate_bind_group(&device, &plate_layout, plates, &cell_map),
+            cell_map,
+            map_pipeline,
             plate_layout,
             plate_boundaries,
             column_mesh: GpuMesh::new(&device, "column", &column.vertices, &column.indices),
@@ -330,7 +373,8 @@ impl Renderer {
 
     /// Replace the plate data, e.g. after regenerating with a new seed.
     pub fn set_plates(&mut self, plates: &Plates, boundaries: &[Segment]) {
-        self.plate_bind_group = create_plate_bind_group(&self.device, &self.plate_layout, plates);
+        self.plate_bind_group =
+            create_plate_bind_group(&self.device, &self.plate_layout, plates, &self.cell_map);
         self.plate_boundaries
             .write(&self.device, &self.queue, boundaries);
     }
@@ -385,11 +429,16 @@ impl Renderer {
             });
             pass.set_bind_group(0, &self.globals_bind_group, &[]);
 
-            pass.set_pipeline(&self.globe_pipeline);
             pass.set_bind_group(1, &self.plate_bind_group, &[]);
-            pass.set_vertex_buffer(0, self.globe.vertices.slice(..));
-            pass.set_index_buffer(self.globe.indices.slice(..), wgpu::IndexFormat::Uint32);
-            pass.draw_indexed(0..self.globe.index_count, 0, 0..1);
+            if globals.flags[1] == Projection::Globe.id() {
+                pass.set_pipeline(&self.globe_pipeline);
+                pass.set_vertex_buffer(0, self.globe.vertices.slice(..));
+                pass.set_index_buffer(self.globe.indices.slice(..), wgpu::IndexFormat::Uint32);
+                pass.draw_indexed(0..self.globe.index_count, 0, 0..1);
+            } else {
+                pass.set_pipeline(&self.map_pipeline);
+                pass.draw(0..3, 0..1);
+            }
 
             if self.columns.count > 0 {
                 pass.set_pipeline(&self.column_pipeline);
@@ -404,7 +453,7 @@ impl Renderer {
 
             // Lines last: they test depth but don't write it, and blend.
             pass.set_pipeline(&self.line_pipeline);
-            if globals.layers[0] & LAYER_BOUNDARIES != 0 && self.plate_boundaries.count > 0 {
+            if globals.flags[0] & LAYER_BOUNDARIES != 0 && self.plate_boundaries.count > 0 {
                 pass.set_vertex_buffer(0, self.plate_boundaries.buffer.slice(..));
                 pass.draw(0..6, 0..self.plate_boundaries.count);
             }
@@ -470,6 +519,7 @@ fn create_plate_bind_group(
     device: &wgpu::Device,
     layout: &wgpu::BindGroupLayout,
     plates: &Plates,
+    cell_map: &wgpu::TextureView,
 ) -> wgpu::BindGroup {
     let colors: Vec<[f32; 4]> = plates
         .plates
@@ -497,7 +547,106 @@ fn create_plate_bind_group(
                 binding: 1,
                 resource: plate_color.as_entire_binding(),
             },
+            wgpu::BindGroupEntry {
+                binding: 2,
+                resource: wgpu::BindingResource::TextureView(cell_map),
+            },
         ],
+    })
+}
+
+/// Renders the globe mesh from the planet's center into the six faces of a
+/// cube map, storing the grid cell id seen in each direction, so flat maps
+/// can find the cell under any pixel. Cells never change, so this runs once.
+fn bake_cell_map(
+    device: &wgpu::Device,
+    queue: &wgpu::Queue,
+    globe: &GpuMesh,
+    vertex_layout: wgpu::VertexBufferLayout,
+) -> wgpu::TextureView {
+    let texture = device.create_texture(&wgpu::TextureDescriptor {
+        label: Some("cell map"),
+        size: wgpu::Extent3d {
+            width: CELL_MAP_SIZE,
+            height: CELL_MAP_SIZE,
+            depth_or_array_layers: 6,
+        },
+        mip_level_count: 1,
+        sample_count: 1,
+        dimension: wgpu::TextureDimension::D2,
+        format: CELL_MAP_FORMAT,
+        usage: wgpu::TextureUsages::RENDER_ATTACHMENT | wgpu::TextureUsages::TEXTURE_BINDING,
+        view_formats: &[],
+    });
+    let shader = shader!(device, "cells.wgsl");
+    let layout = device.create_pipeline_layout(&wgpu::PipelineLayoutDescriptor {
+        label: Some("cell map"),
+        bind_group_layouts: &[],
+        immediate_size: 0,
+    });
+    let pipeline = device.create_render_pipeline(&wgpu::RenderPipelineDescriptor {
+        label: Some("cell map"),
+        layout: Some(&layout),
+        vertex: wgpu::VertexState {
+            module: &shader,
+            entry_point: Some("vs_main"),
+            compilation_options: Default::default(),
+            buffers: &[Some(vertex_layout)],
+        },
+        fragment: Some(wgpu::FragmentState {
+            module: &shader,
+            entry_point: Some("fs_main"),
+            compilation_options: Default::default(),
+            targets: &[Some(CELL_MAP_FORMAT.into())],
+        }),
+        // Seen from inside, so the globe's front faces wind backwards.
+        primitive: Default::default(),
+        depth_stencil: None,
+        multisample: Default::default(),
+        multiview_mask: None,
+        cache: None,
+    });
+
+    let mut encoder = device.create_command_encoder(&Default::default());
+    for face in 0..6 {
+        let view = texture.create_view(&wgpu::TextureViewDescriptor {
+            dimension: Some(wgpu::TextureViewDimension::D2),
+            base_array_layer: face,
+            array_layer_count: Some(1),
+            ..Default::default()
+        });
+        let mut pass = encoder.begin_render_pass(&wgpu::RenderPassDescriptor {
+            label: Some("cell map"),
+            color_attachments: &[Some(wgpu::RenderPassColorAttachment {
+                view: &view,
+                resolve_target: None,
+                depth_slice: None,
+                ops: wgpu::Operations {
+                    // NO_CELL in surface.wgsl.
+                    load: wgpu::LoadOp::Clear(wgpu::Color {
+                        r: u32::MAX as f64,
+                        g: 0.0,
+                        b: 0.0,
+                        a: 0.0,
+                    }),
+                    store: wgpu::StoreOp::Store,
+                },
+            })],
+            depth_stencil_attachment: None,
+            timestamp_writes: None,
+            occlusion_query_set: None,
+            multiview_mask: None,
+        });
+        pass.set_pipeline(&pipeline);
+        pass.set_vertex_buffer(0, globe.vertices.slice(..));
+        pass.set_index_buffer(globe.indices.slice(..), wgpu::IndexFormat::Uint32);
+        // The instance index tells the shader which face to render.
+        pass.draw_indexed(0..globe.index_count, 0, face..face + 1);
+    }
+    queue.submit([encoder.finish()]);
+    texture.create_view(&wgpu::TextureViewDescriptor {
+        dimension: Some(wgpu::TextureViewDimension::D2Array),
+        ..Default::default()
     })
 }
 

@@ -48,7 +48,7 @@
         <div id="hud-cell"></div>
         <ul id="hud-polygons"></ul>
         <div class="help">
-          Drag: rotate · Wheel: zoom<br />
+          Drag: move · Wheel: zoom<br />
           Click: add vertex · Double-click / Enter: close<br />
           Backspace: undo vertex · Esc: cancel
         </div>
@@ -58,6 +58,12 @@
         <label><input type="checkbox" id="layer-plates" checked /> Plates</label>
         <label><input type="checkbox" id="layer-boundaries" checked /> Plate boundaries</label>
         <label><input type="checkbox" id="layer-graticule" checked /> Graticule</label>
+        <h2>Projection</h2>
+        <label><input type="radio" name="projection" id="proj-globe" checked /> Globe</label>
+        <label><input type="radio" name="projection" id="proj-equirectangular" /> Cylindrical (equirectangular)</label>
+        <label><input type="radio" name="projection" id="proj-mercator" /> Cylindrical (Mercator)</label>
+        <label><input type="radio" name="projection" id="proj-albers" /> Conic (Albers equal-area)</label>
+        <label><input type="radio" name="projection" id="proj-azimuthal" /> Azimuthal (equidistant, both hemispheres)</label>
         <h2>World</h2>
         <div class="world">
           <span id="world-seed"></span>

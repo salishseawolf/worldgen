@@ -18,8 +18,8 @@ fn vs_main(
 ) -> VertexOut {
     let corner = CORNERS[vi];
     let viewport = globals.params.xy;
-    let ca = globals.view_proj * vec4<f32>(a, 1.0);
-    let cb = globals.view_proj * vec4<f32>(b, 1.0);
+    let ca = world_to_clip(a);
+    let cb = world_to_clip(b);
 
     // Offset perpendicular to the segment in screen space, so lines keep a
     // constant pixel width (WebGPU itself only rasterizes 1 px lines).
@@ -32,7 +32,8 @@ fn vs_main(
     clip = vec4<f32>(clip.xy + normal * corner.y * globals.params.w / viewport * clip.w, clip.zw);
 
     var out: VertexOut;
-    out.clip = clip;
+    // On flat maps, drop segments that would streak across the map's cut.
+    out.clip = select(clip, vec4<f32>(2.0, 2.0, 2.0, 1.0), is_map() && crosses_seam(a, b));
     out.color = color;
     return out;
 }

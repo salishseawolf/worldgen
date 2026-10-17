@@ -32,6 +32,16 @@ impl LonLat {
         DVec3::new(lat.cos() * lon.cos(), lat.sin(), -lat.cos() * lon.sin())
     }
 
+    /// Unit vectors pointing east and north at this point. At the poles,
+    /// "east" follows this point's longitude.
+    pub fn east_north(self) -> (DVec3, DVec3) {
+        let (lon, lat) = (self.lon.to_radians(), self.lat.to_radians());
+        (
+            DVec3::new(-lon.sin(), 0.0, -lon.cos()),
+            DVec3::new(-lat.sin() * lon.cos(), lat.cos(), lat.sin() * lon.sin()),
+        )
+    }
+
     /// `v` need not be normalized, only non-zero.
     pub fn from_vec(v: DVec3) -> Self {
         let v = v.normalize();

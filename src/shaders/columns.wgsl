@@ -22,7 +22,8 @@ fn vs_main(
 
     let world = base + tx * (position.x * width) + up * (position.y * height) + tz * (position.z * width);
     var out: VertexOut;
-    out.clip = globals.view_proj * vec4<f32>(world, 1.0);
+    // On flat maps the column flattens to a disc at its base.
+    out.clip = world_to_clip(world);
     out.normal = tx * normal.x + up * normal.y + tz * normal.z;
     out.color = color;
     return out;
@@ -30,5 +31,6 @@ fn vs_main(
 
 @fragment
 fn fs_main(in: VertexOut) -> @location(0) vec4<f32> {
-    return vec4<f32>(in.color.rgb * (0.35 + 0.65 * lambert(in.normal)), in.color.a);
+    let shade = select(0.35 + 0.65 * lambert(in.normal), 1.0, is_map());
+    return vec4<f32>(in.color.rgb * shade, in.color.a);
 }

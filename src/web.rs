@@ -12,6 +12,7 @@ use crate::draw::Drawing;
 use crate::geo::{EARTH_RADIUS_M, LonLat};
 use crate::grid::Grid;
 use crate::plates::Plates;
+use crate::projection::{MapProjection, MapView, Projection};
 use crate::renderer::{Globals, LAYER_BOUNDARIES, LAYER_GRATICULE, LAYER_PLATES, Renderer};
 use crate::scene::Scene;
 use glam::DVec3;
@@ -31,6 +32,16 @@ const LAYER_TOGGLES: [(&str, u32); 3] = [
     ("layer-boundaries", LAYER_BOUNDARIES),
     ("layer-graticule", LAYER_GRATICULE),
 ];
+/// Projection tray radio buttons.
+const PROJECTION_CHOICES: [(&str, Projection); 5] = [
+    ("proj-globe", Projection::Globe),
+    ("proj-equirectangular", Projection::Equirectangular),
+    ("proj-mercator", Projection::Mercator),
+    ("proj-albers", Projection::Albers),
+    ("proj-azimuthal", Projection::AzimuthalEquidistant),
+];
+/// On flat maps, the cursor column's width in CSS px (see `Scene::build`).
+const MAP_MARKER_PX: f64 = 3.0;
 
 type FrameCallback = Rc<RefCell<Option<Closure<dyn FnMut(f64)>>>>;
 
@@ -51,7 +62,7 @@ struct Press {
     last: (f64, f64),
     dragging: bool,
     /// Surface point (unit vector) under the cursor at press time; dragging
-    /// keeps it under the cursor. None if the press started off the globe.
+    /// keeps it under the cursor. None if the press started off the planet.
     grabbed: Option<DVec3>,
 }
 
@@ -59,6 +70,9 @@ struct App {
     canvas: HtmlCanvasElement,
     renderer: Renderer,
     camera: OrbitCamera,
+    /// The flat map, used unless its projection is `Globe`. Globe and maps
+    /// share one focus: switching views keeps the same point centered.
+    map: MapView,
     drawing: Drawing,
     grid: Grid,
     plates: Plates,
@@ -91,10 +105,29 @@ impl App {
         (2.0 * x / w - 1.0, 1.0 - 2.0 * y / h)
     }
 
+    fn is_map(&self) -> bool {
+        self.map.projection.kind != Projection::Globe
+    }
+
     /// Unit vector of the surface point under a CSS-pixel position.
     fn surface_at(&self, pos: (f64, f64)) -> Option<DVec3> {
         let (x, y) = self.ndc(pos);
+        if self.is_map() {
+            return self.map.surface_at(x, y, self.camera.aspect);
+        }
         ray_sphere(&self.camera.ray(x, y), self.camera.radius).map(DVec3::normalize)
+    }
+
+    fn set_projection(&mut self, kind: Projection) {
+        let focus = if self.is_map() {
+            self.map.projection.center
+        } else {
+            LonLat::from_vec(self.camera.eye_dir())
+        };
+        if kind == Projection::Globe {
+            self.camera.set_eye_dir(focus.to_unit());
+        }
+        self.map = MapView::new(MapProjection::new(kind, focus), self.camera.aspect);
     }
 
     /// Regenerate the plates from `seed` and record it in the URL.
@@ -121,6 +154,7 @@ impl App {
         let dpr = web_sys::window().map_or(1.0, |w| w.device_pixel_ratio());
 
         let hover = self.hover();
+        let screen_center = self.map.screen_center();
         let globals = Globals {
             view_proj: self.camera.view_proj().as_mat4().to_cols_array_2d(),
             light_dir: self.camera.light_dir().as_vec3().extend(0.0).to_array(),
@@ -130,20 +164,35 @@ impl App {
                 self.camera.radius as f32,
                 (LINE_WIDTH_CSS_PX * dpr) as f32,
             ],
-            layers: [self.layers, 0, 0, 0],
+            flags: [self.layers, self.map.projection.kind.id(), 0, 0],
+            projection: self.map.projection.params(),
+            map: [
+                screen_center.x as f32,
+                screen_center.y as f32,
+                self.map.half_height as f32,
+                self.camera.aspect as f32,
+            ],
         };
-        let scene = Scene::build(
-            &self.drawing,
-            hover,
-            self.camera.radius,
-            self.camera.altitude,
-        );
+        let marker_scale = if self.is_map() {
+            // Meters per CSS pixel at the map's nominal scale.
+            let m_per_px = self.map.half_height * self.camera.radius
+                / (self.canvas.client_height().max(1) as f64 / 2.0);
+            MAP_MARKER_PX * m_per_px / Scene::CURSOR_WIDTH
+        } else {
+            self.camera.altitude.min(self.camera.radius)
+        };
+        let scene = Scene::build(&self.drawing, hover, self.camera.radius, marker_scale);
         self.renderer.render(&globals, &scene);
         self.update_hud(hover);
     }
 
     fn update_hud(&mut self, hover: Option<LonLat>) {
-        let text = hover.map_or_else(|| "Off the globe".to_string(), LonLat::display);
+        let off = if self.is_map() {
+            "Off the map"
+        } else {
+            "Off the globe"
+        };
+        let text = hover.map_or_else(|| off.to_string(), LonLat::display);
         set_text(&self.hud_cursor, &text);
         let cell = hover.map_or_else(String::new, |h| {
             let id = self.grid.cell_at(h);
@@ -206,7 +255,17 @@ impl App {
         if let Some(press) = &mut self.press {
             let moved = (pos.0 - press.start.0).hypot(pos.1 - press.start.1);
             press.dragging |= moved > CLICK_SLOP_PX;
-            if press.dragging {
+            if press.dragging && self.map.projection.kind != Projection::Globe {
+                // Turn the globe under the map, as on the globe itself.
+                match press.grabbed {
+                    Some(g) => self.map.drag_to(g, x, y, self.camera.aspect),
+                    None => self.map.drag_by(
+                        pos.0 - press.last.0,
+                        pos.1 - press.last.1,
+                        self.canvas.client_height().max(1) as f64,
+                    ),
+                }
+            } else if press.dragging {
                 // Push the globe by the grabbed point; fall back to pixel
                 // rotation when the press or the cursor is off the globe.
                 let grabbed = press.grabbed.is_some_and(|g| self.camera.drag_to(g, x, y));
@@ -257,7 +316,13 @@ impl App {
         e.prevent_default();
         // deltaMode 1 is lines; treat a line as about 16 px.
         let px = e.delta_y() * if e.delta_mode() == 1 { 16.0 } else { 1.0 };
-        self.camera.zoom(px * 0.001);
+        if self.is_map() {
+            // Zoom about the cursor.
+            let (x, y) = self.ndc((e.offset_x() as f64, e.offset_y() as f64));
+            self.map.zoom_at(px * 0.001, x, y, self.camera.aspect);
+        } else {
+            self.camera.zoom(px * 0.001);
+        }
     }
 }
 
@@ -344,6 +409,7 @@ async fn run() -> Result<(), String> {
         canvas: canvas.clone(),
         renderer,
         camera: OrbitCamera::over(EARTH_RADIUS_M, START_VIEW, START_ALTITUDE_RADII, aspect),
+        map: MapView::new(MapProjection::new(Projection::Globe, START_VIEW), aspect),
         drawing: Drawing::default(),
         grid,
         plates,
@@ -391,6 +457,24 @@ async fn run() -> Result<(), String> {
             "change",
             &app,
             move |app, _: web_sys::Event| app.set_layer(bit, input.checked()),
+        );
+    }
+    for (id, kind) in PROJECTION_CHOICES {
+        let input: HtmlInputElement = element(id)?
+            .dyn_into()
+            .map_err(|_| format!("#{id} is not an input"))?;
+        if input.checked() {
+            app.borrow_mut().set_projection(kind);
+        }
+        listen(
+            &input.clone(),
+            "change",
+            &app,
+            move |app, _: web_sys::Event| {
+                if input.checked() {
+                    app.set_projection(kind);
+                }
+            },
         );
     }
     let new_world = element("new-world")?;
