@@ -115,6 +115,15 @@ pub fn h3_cell(p: LonLat, resolution: Resolution) -> CellIndex {
         .to_cell(resolution)
 }
 
+/// Centers of every H3 cell at `resolution`, as unit vectors: an even
+/// scatter of sites, e.g. for arrows.
+pub fn h3_centers(resolution: Resolution) -> Vec<DVec3> {
+    CellIndex::base_cells()
+        .flat_map(|base| base.children(resolution))
+        .map(|c| to_unit(LatLng::from(c)))
+        .collect()
+}
+
 fn to_unit(ll: LatLng) -> DVec3 {
     LonLat::new(ll.lng(), ll.lat()).to_unit()
 }

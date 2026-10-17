@@ -31,13 +31,48 @@
         border-radius: 6px; padding: 3px 10px; cursor: pointer;
       }
       .tray button:hover { background: #2c3347; }
+      /* Color key, filled in by legend.rs. */
+      #legend {
+        position: fixed; top: 12px; right: 12px; width: min(240px, calc(100vw - 24px));
+        max-height: calc(100vh - 24px); overflow-y: auto;
+        font-size: 12px; line-height: 1.4; user-select: none;
+      }
+      #legend:empty { display: none; }
+      #legend h2 { margin: 0 0 6px; font-size: 11px; font-weight: 600; letter-spacing: 0.06em; text-transform: uppercase; color: #8a93a6; }
+      #legend h2:not(:first-child) { margin-top: 12px; }
+      #legend p { margin: 4px 0; color: #a9b0c0; }
+      #legend .bar { height: 12px; border-radius: 3px; }
+      #legend .ticks { position: relative; height: 16px; margin: 2px 8px 2px; font-size: 11px; font-variant-numeric: tabular-nums; color: #c3c9d6; }
+      #legend .ticks span { position: absolute; transform: translateX(-50%); white-space: nowrap; }
+      #legend .row { display: flex; align-items: center; gap: 8px; padding: 1px 0; }
+      #legend .swatch { width: 12px; height: 12px; border-radius: 2px; flex: none; }
+      #legend .line { width: 16px; height: 3px; border-radius: 2px; flex: none; }
+      #legend .arrow { width: 16px; font-weight: 700; text-align: center; flex: none; }
+      #legend .plates { display: grid; grid-template-columns: repeat(3, 1fr); gap: 2px 8px; font-variant-numeric: tabular-nums; }
+      #legend .plates i { display: inline-block; width: 10px; height: 10px; margin-right: 5px; border-radius: 2px; vertical-align: -1px; }
+      /* On narrow screens the key sits at the bottom so it clears the left panel. */
+      @media (max-width: 700px) {
+        #legend { top: auto; bottom: 12px; max-height: 40vh; }
+      }
       #hud-cursor { font-variant-numeric: tabular-nums; font-weight: 600; }
       #hud-cell { font-variant-numeric: tabular-nums; }
-      #hud-cell:empty { display: none; }
-      #hud-polygons { margin: 6px 0; padding-left: 18px; }
-      #hud-polygons:empty { display: none; }
-      #hud-polygons .drawing { color: #4de6ff; }
-      #hud .help { color: #8a93a6; font-size: 12px; }
+      #hud-cell:empty, #hud-crust:empty { display: none; }
+      #hud-crust { font-variant-numeric: tabular-nums; }
+      #measure .head { display: flex; align-items: center; justify-content: space-between; margin-bottom: 4px; }
+      #measure h2 { margin: 0; font-size: 11px; font-weight: 600; letter-spacing: 0.06em; text-transform: uppercase; color: #8a93a6; }
+      #measure dl { display: grid; grid-template-columns: auto 1fr; gap: 1px 10px; margin: 0; font-variant-numeric: tabular-nums; }
+      #measure dt { color: #8a93a6; }
+      #measure dd { margin: 0; }
+      #measure .help { margin-top: 4px; }
+      #measure-copy {
+        display: grid; place-items: center; width: 26px; height: 26px; padding: 0;
+        color: #ddd; background: #232838; border: 1px solid #39405a; border-radius: 6px; cursor: pointer;
+      }
+      #measure-copy:hover { background: #2c3347; }
+      /* After copying, the clipboard icon briefly becomes a check mark. */
+      #measure-copy .check, #measure-copy.copied .clip { display: none; }
+      #measure-copy.copied .check { display: block; color: #6ced94; }
+      .help { color: #8a93a6; font-size: 12px; }
     </style>
   </head>
   <body>
@@ -46,17 +81,42 @@
       <div id="hud" class="card">
         <div id="hud-cursor"></div>
         <div id="hud-cell"></div>
-        <ul id="hud-polygons"></ul>
+        <div id="hud-crust"></div>
         <div class="help">
           Drag: move · Wheel: zoom<br />
-          Click: add vertex · Double-click / Enter: close<br />
-          Backspace: undo vertex · Esc: cancel
+          Click: measure from a point, click again to finish
         </div>
       </div>
+      <div id="measure" class="card" hidden>
+        <div class="head">
+          <h2>Measurement</h2>
+          <button type="button" id="measure-copy" title="Copy to clipboard" aria-label="Copy measurement to clipboard">
+            <svg class="clip" width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true">
+              <rect x="8" y="2" width="8" height="4" rx="1" />
+              <path d="M16 4h2a2 2 0 0 1 2 2v14a2 2 0 0 1-2 2H6a2 2 0 0 1-2-2V6a2 2 0 0 1 2-2h2" />
+            </svg>
+            <svg class="check" width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.5" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true">
+              <path d="M20 6 9 17l-5-5" />
+            </svg>
+          </button>
+        </div>
+        <dl>
+          <dt>Source</dt><dd id="measure-source"></dd>
+          <dt>Bearing</dt><dd id="measure-bearing"></dd>
+          <dt>Distance</dt><dd id="measure-distance"></dd>
+        </dl>
+        <div id="measure-status" class="help"></div>
+      </div>
       <div class="card tray">
-        <h2>Layers</h2>
-        <label><input type="checkbox" id="layer-plates" checked /> Plates</label>
+        <h2>Color by</h2>
+        <label><input type="radio" name="color" id="color-elevation" checked /> Elevation</label>
+        <label><input type="radio" name="color" id="color-plates" /> Plates</label>
+        <label><input type="radio" name="color" id="color-age" /> Seafloor age</label>
+        <label><input type="radio" name="color" id="color-crust" /> Crust type and thickness</label>
+        <h2>Overlays</h2>
         <label><input type="checkbox" id="layer-boundaries" checked /> Plate boundaries</label>
+        <label><input type="checkbox" id="layer-motion" /> Plate motion</label>
+        <label><input type="checkbox" id="layer-mantle" /> Mantle flow</label>
         <label><input type="checkbox" id="layer-graticule" checked /> Graticule</label>
         <h2>Projection</h2>
         <label><input type="radio" name="projection" id="proj-globe" checked /> Globe</label>
@@ -71,6 +131,7 @@
         </div>
       </div>
     </div>
+    <div id="legend" class="card"></div>
     <div id="error" hidden></div>
   </body>
 </html>

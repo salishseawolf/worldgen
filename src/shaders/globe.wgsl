@@ -16,6 +16,8 @@ fn vs_main(@location(0) position: vec3<f32>, @location(1) cell: u32) -> VertexOu
 @fragment
 fn fs_main(in: VertexOut) -> @location(0) vec4<f32> {
     let p = normalize(in.unit);
-    let base = surface_albedo(in.cell) * (0.12 + 0.88 * lambert(p));
+    // Lighting is in linear light: 2% ambient keeps the night side dark
+    // but legible (about 15% brightness once encoded to sRGB).
+    let base = surface_albedo(in.cell) * (0.02 + 0.98 * lambert(p));
     return vec4<f32>(with_graticule(base, p), 1.0);
 }

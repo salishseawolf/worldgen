@@ -83,6 +83,7 @@ pub fn great_circle_arc(a: DVec3, b: DVec3, max_step: f64) -> Vec<DVec3> {
 /// counterclockwise seen from outside the sphere, i.e. the interior is on the
 /// left. Fan-triangulates from vertex 0 using the Van Oosterom-Strackee
 /// triangle formula, so it is exact for any ring smaller than a hemisphere.
+#[cfg(test)]
 pub fn signed_area(ring: &[DVec3]) -> f64 {
     if ring.len() < 3 {
         return 0.0;
@@ -99,44 +100,51 @@ pub fn signed_area(ring: &[DVec3]) -> f64 {
         .sum()
 }
 
-/// A polygon with great-circle edges, shaped for a direct GeoJSON mapping.
-///
-/// `exterior` is an open ring (the closing point is not repeated) wound
-/// counterclockwise, matching the RFC 7946 right-hand rule for exterior rings.
-/// GeoJSON export needs only to append `exterior[0]`, densify edges with
-/// [`great_circle_arc`] (GeoJSON edges are straight in lon/lat), and split
-/// rings that cross the antimeridian.
-#[derive(Clone, Debug, PartialEq)]
-pub struct Polygon {
-    pub exterior: Vec<LonLat>,
+/// Great-circle distance (m) between two points on a sphere of `radius`.
+pub fn distance_m(a: LonLat, b: LonLat, radius: f64) -> f64 {
+    a.to_unit().angle_between(b.to_unit()) * radius
 }
 
-impl Polygon {
-    /// Builds a polygon from at least 3 distinct vertices in either winding.
-    /// The region taken as the interior is the smaller of the two the ring
-    /// divides the sphere into.
-    pub fn from_ring(mut ring: Vec<LonLat>) -> Option<Self> {
-        if ring.len() > 1 && same_point(ring[0], ring[ring.len() - 1]) {
-            ring.pop();
-        }
-        if ring.len() < 3 {
-            return None;
-        }
-        let units: Vec<DVec3> = ring.iter().map(|p| p.to_unit()).collect();
-        if signed_area(&units) < 0.0 {
-            ring.reverse();
-        }
-        Some(Self { exterior: ring })
+/// Initial bearing of the great circle from `a` toward `b`, in degrees
+/// clockwise from true north (0 to 360). None when the direction is
+/// undefined: the same point, or exactly opposite points.
+pub fn initial_bearing_deg(a: LonLat, b: LonLat) -> Option<f64> {
+    let (pa, pb) = (a.to_unit(), b.to_unit());
+    // Direction toward b in the tangent plane at a.
+    let toward = pb - pa * pa.dot(pb);
+    if toward.length() < SAME_POINT_RAD {
+        return None;
     }
-
-    pub fn area_m2(&self, radius: f64) -> f64 {
-        let units: Vec<DVec3> = self.exterior.iter().map(|p| p.to_unit()).collect();
-        signed_area(&units).abs() * radius * radius
-    }
+    let (east, north) = a.east_north();
+    Some(
+        toward
+            .dot(east)
+            .atan2(toward.dot(north))
+            .to_degrees()
+            .rem_euclid(360.0),
+    )
 }
 
-pub fn same_point(a: LonLat, b: LonLat) -> bool {
-    a.to_unit().angle_between(b.to_unit()) < SAME_POINT_RAD
+/// The nearest of the 16 compass points, e.g. `WSW` for 247.5°.
+pub fn compass_point(bearing_deg: f64) -> &'static str {
+    const POINTS: [&str; 16] = [
+        "N", "NNE", "NE", "ENE", "E", "ESE", "SE", "SSE", "S", "SSW", "SW", "WSW", "W", "WNW",
+        "NW", "NNW",
+    ];
+    POINTS[((bearing_deg.rem_euclid(360.0) / 22.5).round() as usize) % 16]
+}
+
+/// Thousands separators, e.g. 1,234,567.
+pub fn group_thousands(n: u64) -> String {
+    let digits = n.to_string();
+    let mut out = String::new();
+    for (i, c) in digits.chars().enumerate() {
+        if i > 0 && (digits.len() - i).is_multiple_of(3) {
+            out.push(',');
+        }
+        out.push(c);
+    }
+    out
 }
 
 #[cfg(test)]
@@ -204,67 +212,56 @@ mod tests {
     #[test]
     fn octant_area() {
         // One eighth of the sphere: 4π / 8 steradians.
-        let ring = vec![
+        let ring = [
             LonLat::new(0.0, 0.0),
             LonLat::new(-90.0, 0.0),
             LonLat::new(0.0, 90.0),
         ];
         let units: Vec<DVec3> = ring.iter().map(|p| p.to_unit()).collect();
         assert!(close(signed_area(&units).abs(), PI / 2.0, 1e-12));
-        let poly = Polygon::from_ring(ring).unwrap();
-        let expected = 4.0 * PI * EARTH_RADIUS_M.powi(2) / 8.0;
-        assert!(close(poly.area_m2(EARTH_RADIUS_M) / expected, 1.0, 1e-12));
     }
 
     #[test]
-    fn winding_normalized_to_ccw() {
-        let cw = vec![
-            LonLat::new(0.0, 0.0),
-            LonLat::new(0.0, 10.0),
-            LonLat::new(10.0, 10.0),
-            LonLat::new(10.0, 0.0),
-        ];
-        let units: Vec<DVec3> = cw.iter().map(|p| p.to_unit()).collect();
-        assert!(signed_area(&units) < 0.0);
-        let poly = Polygon::from_ring(cw.clone()).unwrap();
-        let units: Vec<DVec3> = poly.exterior.iter().map(|p| p.to_unit()).collect();
-        assert!(signed_area(&units) > 0.0);
-        // Already CCW stays as drawn.
-        let ccw: Vec<LonLat> = cw.into_iter().rev().collect();
-        assert_eq!(Polygon::from_ring(ccw.clone()).unwrap().exterior, ccw);
+    fn distance_and_bearing() {
+        let origin = LonLat::new(0.0, 0.0);
+        let quarter = PI / 2.0 * EARTH_RADIUS_M;
+        let east = LonLat::new(90.0, 0.0);
+        assert!(close(
+            distance_m(origin, east, EARTH_RADIUS_M),
+            quarter,
+            1e-6
+        ));
+        assert!(close(
+            initial_bearing_deg(origin, east).unwrap(),
+            90.0,
+            1e-9
+        ));
+        let north = initial_bearing_deg(origin, LonLat::new(0.0, 10.0)).unwrap();
+        assert!(north < 1e-9 || north > 360.0 - 1e-9, "{north}");
+        let west = initial_bearing_deg(origin, LonLat::new(-10.0, 0.0)).unwrap();
+        assert!(close(west, 270.0, 1e-9));
+
+        // London to New York: about 5,570 km on a mean-radius sphere,
+        // setting off at about 288.3° (west-northwest).
+        let london = LonLat::new(-0.1278, 51.5074);
+        let new_york = LonLat::new(-74.0060, 40.7128);
+        let km = distance_m(london, new_york, EARTH_RADIUS_M) / 1000.0;
+        assert!(close(km, 5570.2, 1.0), "{km}");
+        let bearing = initial_bearing_deg(london, new_york).unwrap();
+        assert!(close(bearing, 288.3, 0.1), "{bearing}");
+        assert_eq!(compass_point(bearing), "WNW");
+
+        assert!(initial_bearing_deg(london, london).is_none());
+        let opposite = LonLat::new(london.lon + 180.0, -london.lat);
+        assert!(initial_bearing_deg(london, opposite).is_none());
     }
 
     #[test]
-    fn polygon_across_antimeridian_and_around_pole() {
-        let across = Polygon::from_ring(vec![
-            LonLat::new(170.0, -5.0),
-            LonLat::new(-170.0, -5.0),
-            LonLat::new(-170.0, 5.0),
-            LonLat::new(170.0, 5.0),
-        ])
-        .unwrap();
-        // About 20° x 10° near the equator, not the complementary region.
-        let area_sr = across.area_m2(1.0);
-        assert!(area_sr > 0.05 && area_sr < 0.07, "{area_sr}");
-
-        let cap = Polygon::from_ring(
-            (0..6)
-                .map(|i| LonLat::new(-180.0 + 60.0 * i as f64, 80.0))
-                .collect(),
-        )
-        .unwrap();
-        assert!(cap.area_m2(1.0) < 0.2);
-    }
-
-    #[test]
-    fn rejects_degenerate_and_drops_closing_point() {
-        assert!(Polygon::from_ring(vec![LonLat::new(0.0, 0.0), LonLat::new(1.0, 1.0)]).is_none());
-        let closed = vec![
-            LonLat::new(0.0, 0.0),
-            LonLat::new(10.0, 0.0),
-            LonLat::new(10.0, 10.0),
-            LonLat::new(0.0, 0.0),
-        ];
-        assert_eq!(Polygon::from_ring(closed).unwrap().exterior.len(), 3);
+    fn compass_points_and_grouping() {
+        assert_eq!(compass_point(0.0), "N");
+        assert_eq!(compass_point(359.0), "N");
+        assert_eq!(compass_point(247.5), "WSW");
+        assert_eq!(group_thousands(1_234_567), "1,234,567");
+        assert_eq!(group_thousands(12), "12");
     }
 }

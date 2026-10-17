@@ -3,10 +3,10 @@
 use bytemuck::{Pod, Zeroable};
 use glam::DVec3;
 
-use crate::draw::Drawing;
 use crate::geo::{LonLat, great_circle_arc};
-use crate::grid::Grid;
-use crate::plates::Plates;
+use crate::mantle::CM_PER_YEAR;
+use crate::measure::Measure;
+use crate::tectonics::{Boundary, BoundaryKind, Edge};
 
 /// Outlines float this far above the surface (fraction of radius) so they
 /// don't z-fight with the globe's facets.
@@ -15,11 +15,25 @@ const LINE_LIFT: f64 = 1.0005;
 const ARC_STEP_DEG: f64 = 0.5;
 
 const CURSOR_COLOR: [f32; 4] = [0.9, 0.1, 0.1, 1.0];
-const VERTEX_COLOR: [f32; 4] = [0.2, 0.9, 1.0, 1.0];
-const DRAWING_COLOR: [f32; 4] = [0.2, 0.9, 1.0, 1.0];
-const RUBBER_BAND_COLOR: [f32; 4] = [0.2, 0.9, 1.0, 0.5];
-const POLYGON_COLOR: [f32; 4] = [1.0, 0.8, 0.2, 1.0];
-const PLATE_BOUNDARY_COLOR: [f32; 4] = [0.05, 0.05, 0.08, 0.85];
+const MEASURE_COLOR: [f32; 4] = [0.2, 0.9, 1.0, 1.0];
+/// The line while it still follows the cursor.
+const MEASURING_COLOR: [f32; 4] = [0.2, 0.9, 1.0, 0.6];
+/// Arrow length per cm/yr of speed (degrees of arc), and the cap.
+pub const ARROW_DEG_PER_CM_YEAR: f64 = 0.45;
+const ARROW_MAX_DEG: f64 = 7.0;
+pub const PLATE_MOTION_COLOR: [f32; 4] = [0.95, 0.95, 0.95, 0.9];
+pub const MANTLE_FLOW_COLOR: [f32; 4] = [1.0, 0.55, 0.85, 0.9];
+
+/// Line color for each boundary type; index.html shows the same as a key.
+pub fn boundary_color(kind: BoundaryKind) -> [f32; 4] {
+    match kind {
+        BoundaryKind::Ridge => [1.0, 0.18, 0.1, 1.0],
+        BoundaryKind::Rift => [1.0, 0.5, 0.05, 1.0],
+        BoundaryKind::Subduction => [0.7, 0.1, 0.75, 1.0],
+        BoundaryKind::Collision => [1.0, 0.85, 0.1, 1.0],
+        BoundaryKind::Transform => [0.15, 0.85, 0.3, 1.0],
+    }
+}
 
 /// A screen-space-width line segment between two world points.
 /// Fields are tightly packed to match `vertex_attr_array!` offsets.
@@ -55,24 +69,30 @@ impl Scene {
 
     /// `marker_scale` (meters) sizes the column markers; callers vary it with
     /// zoom so markers keep a steady on-screen size.
-    pub fn build(drawing: &Drawing, hover: Option<LonLat>, radius: f64, marker_scale: f64) -> Self {
+    pub fn build(measure: &Measure, hover: Option<LonLat>, radius: f64, marker_scale: f64) -> Self {
         let mut scene = Scene::default();
-
-        for polygon in &drawing.polygons {
-            let ring: Vec<DVec3> = polygon.exterior.iter().map(|p| p.to_unit()).collect();
-            scene.add_path(&ring, true, radius, POLYGON_COLOR);
-        }
-
-        let current: Vec<DVec3> = drawing.current.iter().map(|p| p.to_unit()).collect();
-        scene.add_path(&current, false, radius, DRAWING_COLOR);
-        if let (Some(&last), Some(h)) = (current.last(), hover) {
-            scene.add_path(&[last, h.to_unit()], false, radius, RUBBER_BAND_COLOR);
-        }
-
         let marker = marker_scale;
-        for &p in &current {
-            scene.add_column(p, radius, marker * 0.02, marker * 0.003, VERTEX_COLOR);
+
+        // The measurement: a great-circle line, with a marker at each end
+        // that is fixed (the cursor column marks a live end).
+        if let Some((a, b)) = measure.span(hover) {
+            let color = if measure.is_finished() {
+                MEASURE_COLOR
+            } else {
+                MEASURING_COLOR
+            };
+            scene.add_path(&[a.to_unit(), b.to_unit()], false, radius, color);
         }
+        for p in [measure.source, measure.target].into_iter().flatten() {
+            scene.add_column(
+                p.to_unit(),
+                radius,
+                marker * 0.03,
+                marker * 0.003,
+                MEASURE_COLOR,
+            );
+        }
+
         if let Some(h) = hover {
             scene.add_column(
                 h.to_unit(),
@@ -85,13 +105,46 @@ impl Scene {
         scene
     }
 
-    /// Outlines along every cell edge where two plates meet. These only
-    /// change when the plates do, so they are built once, not per frame.
-    pub fn plate_boundaries(grid: &Grid, plates: &Plates, radius: f64) -> Vec<Segment> {
+    /// Plate boundary lines colored by type. These only change when the
+    /// world does, so they are built once, not per frame.
+    pub fn boundary_lines(edges: &[Edge], boundaries: &[Boundary], radius: f64) -> Vec<Segment> {
         let mut scene = Scene::default();
-        for (a, b, path) in grid.shared_edges() {
-            if plates.cell_plate[a as usize] != plates.cell_plate[b as usize] {
-                scene.add_path(&path, false, radius, PLATE_BOUNDARY_COLOR);
+        for b in boundaries {
+            let path = &edges[b.edge as usize].path;
+            scene.add_path(path, false, radius, boundary_color(b.kind));
+        }
+        scene.segments
+    }
+
+    /// An arrow at each of `sites` (unit vectors) along `velocity` there
+    /// (rad/Myr, tangent), with length proportional to speed.
+    pub fn arrows(
+        sites: &[DVec3],
+        velocity: impl Fn(DVec3) -> DVec3,
+        radius: f64,
+        color: [f32; 4],
+    ) -> Vec<Segment> {
+        let mut scene = Scene::default();
+        for &p in sites {
+            let v = velocity(p);
+            let speed = v.length() / CM_PER_YEAR;
+            if speed < 0.05 {
+                continue;
+            }
+            let length = (speed * ARROW_DEG_PER_CM_YEAR)
+                .min(ARROW_MAX_DEG)
+                .to_radians();
+            let dir = v.normalize();
+            let tip = p * length.cos() + dir * length.sin();
+            scene.add_path(&[p, tip], false, radius, color);
+            // Two barbs swept back from the tip.
+            let back = (p - tip * p.dot(tip)).normalize();
+            let side = tip.cross(back);
+            let barb = 0.35 * length;
+            for s in [-1.0, 1.0] {
+                let d = (back * 0.9 + side * (0.45 * s)).normalize();
+                let end = tip * barb.cos() + d * barb.sin();
+                scene.add_path(&[tip, end], false, radius, color);
             }
         }
         scene.segments
@@ -142,33 +195,29 @@ mod tests {
     use crate::geo::EARTH_RADIUS_M;
 
     #[test]
-    fn closed_polygon_outline_is_continuous_loop() {
-        let mut d = Drawing::default();
-        for p in [(0.0, 0.0), (10.0, 0.0), (10.0, 10.0)] {
-            d.add_vertex(LonLat::new(p.0, p.1));
-        }
-        assert!(d.close());
-        let s = Scene::build(&d, None, EARTH_RADIUS_M, EARTH_RADIUS_M);
-        assert!(s.segments.len() > 3, "edges are densified");
+    fn measurement_line_follows_cursor_then_stays() {
+        let mut m = Measure::default();
+        m.click(LonLat::new(0.0, 0.0));
+        let hover = Some(LonLat::new(10.0, 0.0));
+        let s = Scene::build(&m, hover, EARTH_RADIUS_M, EARTH_RADIUS_M);
+        assert!(s.segments.len() > 3, "great circle is densified");
+        assert!(s.segments.iter().all(|seg| seg.color == MEASURING_COLOR));
         for w in s.segments.windows(2) {
-            assert_eq!(w[0].b, w[1].a);
+            assert_eq!(w[0].b, w[1].a, "continuous");
         }
-        assert_eq!(s.segments.last().unwrap().b, s.segments[0].a);
-        assert!(s.columns.is_empty());
+        // Source marker plus the cursor.
+        assert_eq!(s.columns.len(), 2);
+        assert_eq!(s.columns[1].color, CURSOR_COLOR);
+
+        m.click(LonLat::new(10.0, 0.0));
+        let s = Scene::build(&m, None, EARTH_RADIUS_M, EARTH_RADIUS_M);
+        assert!(s.segments.iter().all(|seg| seg.color == MEASURE_COLOR));
+        assert_eq!(s.columns.len(), 2, "both ends marked");
     }
 
     #[test]
-    fn hover_adds_cursor_column_and_rubber_band() {
-        let mut d = Drawing::default();
-        d.add_vertex(LonLat::new(0.0, 0.0));
-        let s = Scene::build(
-            &d,
-            Some(LonLat::new(5.0, 5.0)),
-            EARTH_RADIUS_M,
-            EARTH_RADIUS_M,
-        );
-        assert_eq!(s.columns.len(), 2, "one vertex marker plus the cursor");
-        assert_eq!(s.columns[1].color, CURSOR_COLOR);
-        assert!(!s.segments.is_empty());
+    fn nothing_without_measurement_or_cursor() {
+        let s = Scene::build(&Measure::default(), None, EARTH_RADIUS_M, EARTH_RADIUS_M);
+        assert!(s.segments.is_empty() && s.columns.is_empty());
     }
 }

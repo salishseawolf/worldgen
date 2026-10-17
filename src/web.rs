@@ -8,13 +8,20 @@ use web_sys::{
 };
 
 use crate::camera::{OrbitCamera, ray_sphere};
-use crate::draw::Drawing;
-use crate::geo::{EARTH_RADIUS_M, LonLat};
-use crate::grid::Grid;
-use crate::plates::Plates;
+use crate::geo::{EARTH_RADIUS_M, LonLat, group_thousands};
+use crate::grid::{Grid, h3_centers};
+use crate::legend::{self, PlateKey};
+use crate::mantle::CM_PER_YEAR;
+use crate::measure::{Measure, Reading};
 use crate::projection::{MapProjection, MapView, Projection};
-use crate::renderer::{Globals, LAYER_BOUNDARIES, LAYER_GRATICULE, LAYER_PLATES, Renderer};
-use crate::scene::Scene;
+use crate::renderer::{Globals, Renderer};
+use crate::scene::{MANTLE_FLOW_COLOR, PLATE_MOTION_COLOR, Scene};
+use crate::tectonics::{Edge, edges};
+use crate::view::{
+    COLOR_AGE, COLOR_CRUST, COLOR_ELEVATION, COLOR_PLATES, LAYER_BOUNDARIES, LAYER_GRATICULE,
+    LAYER_MANTLE, LAYER_MOTION,
+};
+use crate::world::World;
 use glam::DVec3;
 use h3o::Resolution;
 
@@ -26,11 +33,21 @@ const CLICK_SLOP_PX: f64 = 4.0;
 const LINE_WIDTH_CSS_PX: f64 = 2.0;
 /// About 41k cells, each roughly 0.6° across: plenty for plates.
 const PLATE_RESOLUTION: Resolution = Resolution::Three;
+/// Arrows sit at the centers of this coarser H3 grid (842 cells).
+const ARROW_RESOLUTION: Resolution = Resolution::One;
 /// Layer tray checkboxes and the layer bit each controls.
-const LAYER_TOGGLES: [(&str, u32); 3] = [
-    ("layer-plates", LAYER_PLATES),
+const LAYER_TOGGLES: [(&str, u32); 4] = [
     ("layer-boundaries", LAYER_BOUNDARIES),
+    ("layer-motion", LAYER_MOTION),
+    ("layer-mantle", LAYER_MANTLE),
     ("layer-graticule", LAYER_GRATICULE),
+];
+/// "Color by" tray radio buttons.
+const COLOR_CHOICES: [(&str, u32); 4] = [
+    ("color-elevation", COLOR_ELEVATION),
+    ("color-plates", COLOR_PLATES),
+    ("color-age", COLOR_AGE),
+    ("color-crust", COLOR_CRUST),
 ];
 /// Projection tray radio buttons.
 const PROJECTION_CHOICES: [(&str, Projection); 5] = [
@@ -40,6 +57,8 @@ const PROJECTION_CHOICES: [(&str, Projection); 5] = [
     ("proj-albers", Projection::Albers),
     ("proj-azimuthal", Projection::AzimuthalEquidistant),
 ];
+/// How long the copy button shows its check mark.
+const COPIED_MS: i32 = 1500;
 /// On flat maps, the cursor column's width in CSS px (see `Scene::build`).
 const MAP_MARKER_PX: f64 = 3.0;
 
@@ -73,21 +92,40 @@ struct App {
     /// The flat map, used unless its projection is `Globe`. Globe and maps
     /// share one focus: switching views keeps the same point centered.
     map: MapView,
-    drawing: Drawing,
+    measure: Measure,
+    /// Last on-planet cursor position while measuring, so the box keeps
+    /// the live reading when the cursor leaves to click the copy button.
+    measure_end: Option<LonLat>,
+    measure_box: MeasureBox,
     grid: Grid,
-    plates: Plates,
+    edges: Vec<Edge>,
+    world: World,
+    arrow_sites: Vec<DVec3>,
     /// World seed, mirrored in the URL as `?seed=` so worlds can be shared.
     seed: u64,
     /// Visible `LAYER_*` bits, mirroring the tray checkboxes.
     layers: u32,
+    /// `COLOR_*` mode, mirroring the tray radio buttons.
+    color: u32,
     /// Cursor in CSS pixels relative to the canvas, if over it.
     cursor: Option<(f64, f64)>,
     press: Option<Press>,
     hud_cursor: Element,
     hud_cell: Element,
+    hud_crust: Element,
     world_seed: Element,
-    hud_polygons: Element,
+    legend: Element,
     hud_dirty: bool,
+}
+
+/// The measurement info box.
+struct MeasureBox {
+    card: Element,
+    source: Element,
+    bearing: Element,
+    distance: Element,
+    status: Element,
+    copy: Element,
 }
 
 impl App {
@@ -130,14 +168,64 @@ impl App {
         self.map = MapView::new(MapProjection::new(kind, focus), self.camera.aspect);
     }
 
-    /// Regenerate the plates from `seed` and record it in the URL.
+    /// Regenerate the world from `seed` and record it in the URL.
     fn set_seed(&mut self, seed: u64) {
         self.seed = seed;
-        self.plates = Plates::generate(&self.grid, seed);
-        let boundaries = Scene::plate_boundaries(&self.grid, &self.plates, self.camera.radius);
-        self.renderer.set_plates(&self.plates, &boundaries);
+        self.world = World::generate(&self.grid, &self.edges, seed);
+        self.renderer.set_world(&self.world);
+        self.update_overlays();
+        self.update_legend();
         write_seed_to_url(seed);
         self.hud_dirty = true;
+    }
+
+    fn set_color(&mut self, mode: u32) {
+        self.color = mode;
+        self.update_legend();
+    }
+
+    /// Redraw the color key for the current mode, overlays and plates.
+    fn update_legend(&self) {
+        let plates = &self.world.plates;
+        let mut sums = vec![(0.0, 0.0); plates.plates.len()];
+        for (c, &p) in self.grid.centers.iter().enumerate() {
+            let plate = plates.cell_plate[c] as usize;
+            sums[plate].0 += plates.plates[plate].omega.cross(p).length() / CM_PER_YEAR;
+            sums[plate].1 += 1.0;
+        }
+        let keys: Vec<PlateKey> = plates
+            .plates
+            .iter()
+            .zip(sums)
+            .map(|(p, (sum, n))| PlateKey {
+                color: p.color,
+                speed_cm_year: sum / f64::max(n, 1.0),
+            })
+            .collect();
+        self.legend
+            .set_inner_html(&legend::html(self.color, self.layers, &keys));
+    }
+
+    /// Rebuild the line overlays for the current world.
+    fn update_overlays(&mut self) {
+        let r = self.camera.radius;
+        let w = &self.world;
+        let grid = &self.grid;
+        let boundaries = Scene::boundary_lines(&self.edges, &w.boundaries, r);
+        let plate_velocity = |p: DVec3| {
+            let cell = grid.cell_at(LonLat::from_vec(p));
+            w.plates.plate_at(cell).omega.cross(p)
+        };
+        let motion = Scene::arrows(&self.arrow_sites, plate_velocity, r, PLATE_MOTION_COLOR);
+        let mantle = Scene::arrows(
+            &self.arrow_sites,
+            |p| w.mantle.velocity(p),
+            r,
+            MANTLE_FLOW_COLOR,
+        );
+        self.renderer.set_overlay(LAYER_BOUNDARIES, &boundaries);
+        self.renderer.set_overlay(LAYER_MOTION, &motion);
+        self.renderer.set_overlay(LAYER_MANTLE, &mantle);
     }
 
     fn set_layer(&mut self, bit: u32, on: bool) {
@@ -146,6 +234,7 @@ impl App {
         } else {
             self.layers &= !bit;
         }
+        self.update_legend();
     }
 
     fn frame(&mut self) {
@@ -164,7 +253,7 @@ impl App {
                 self.camera.radius as f32,
                 (LINE_WIDTH_CSS_PX * dpr) as f32,
             ],
-            flags: [self.layers, self.map.projection.kind.id(), 0, 0],
+            flags: [self.layers, self.map.projection.kind.id(), self.color, 0],
             projection: self.map.projection.params(),
             map: [
                 screen_center.x as f32,
@@ -181,7 +270,10 @@ impl App {
         } else {
             self.camera.altitude.min(self.camera.radius)
         };
-        let scene = Scene::build(&self.drawing, hover, self.camera.radius, marker_scale);
+        if !self.measure.is_finished() && hover.is_some() {
+            self.measure_end = hover;
+        }
+        let scene = Scene::build(&self.measure, hover, self.camera.radius, marker_scale);
         self.renderer.render(&globals, &scene);
         self.update_hud(hover);
     }
@@ -194,44 +286,81 @@ impl App {
         };
         let text = hover.map_or_else(|| off.to_string(), LonLat::display);
         set_text(&self.hud_cursor, &text);
-        let cell = hover.map_or_else(String::new, |h| {
+        let (cell, crust) = hover.map_or_else(Default::default, |h| {
             let id = self.grid.cell_at(h);
-            let plate = self.plates.plate_at(id);
-            format!(
-                "Cell {} · plate {}, {}, {:.1} cm/yr",
-                self.grid.cells[id as usize],
-                self.plates.cell_plate[id as usize] + 1,
-                plate.kind.name(),
-                plate.speed_cm_per_year(h.to_unit(), self.camera.radius)
-            )
+            let c = id as usize;
+            let plates = &self.world.plates;
+            let cell = format!(
+                "Cell {} · plate {}, {:.1} cm/yr",
+                self.grid.cells[c],
+                plates.cell_plate[c] + 1,
+                plates
+                    .plate_at(id)
+                    .speed_cm_per_year(h.to_unit(), self.camera.radius)
+            );
+            let crust = &self.world.crust;
+            let elevation = format_meters(crust.elevation_m[c]);
+            let crust = if crust.kind[c].is_continental() {
+                format!(
+                    "Continent, {:.0} km crust, {elevation}",
+                    crust.thickness_km[c]
+                )
+            } else {
+                format!("Ocean floor, {:.0} Myr old, {elevation}", crust.age_myr[c])
+            };
+            (cell, crust)
         });
         set_text(&self.hud_cell, &cell);
+        set_text(&self.hud_crust, &crust);
+        self.update_measure_box();
         if !self.hud_dirty {
             return;
         }
         self.hud_dirty = false;
         set_text(&self.world_seed, &format!("Seed {}", self.seed));
-        let mut html: String = self
-            .drawing
-            .polygons
-            .iter()
-            .enumerate()
-            .map(|(i, p)| {
-                format!(
-                    "<li>Polygon {}: {} vertices, {} km²</li>",
-                    i + 1,
-                    p.exterior.len(),
-                    format_km2(p.area_m2(self.camera.radius))
-                )
-            })
-            .collect();
-        if !self.drawing.current.is_empty() {
-            html.push_str(&format!(
-                "<li class=\"drawing\">Drawing: {} vertices</li>",
-                self.drawing.current.len()
-            ));
+    }
+
+    /// The current measurement, finished or still following the cursor.
+    fn reading(&self) -> Option<Reading> {
+        let (a, b) = self.measure.span(self.measure_end)?;
+        Some(Reading::new(a, b, self.camera.radius))
+    }
+
+    fn update_measure_box(&self) {
+        let b = &self.measure_box;
+        let Some(source) = self.measure.source else {
+            let _ = b.card.set_attribute("hidden", "");
+            return;
+        };
+        let _ = b.card.remove_attribute("hidden");
+        set_text(&b.source, &source.display());
+        let reading = self.reading();
+        set_text(
+            &b.bearing,
+            &reading
+                .as_ref()
+                .map_or_else(String::new, Reading::bearing_text),
+        );
+        set_text(
+            &b.distance,
+            &reading
+                .as_ref()
+                .map_or_else(String::new, Reading::distance_text),
+        );
+        set_text(
+            &b.status,
+            if self.measure.is_finished() {
+                "Click to start a new measurement · Esc: clear"
+            } else {
+                "Click to set the end point · Esc: clear"
+            },
+        );
+    }
+
+    fn copy_measurement(&self) {
+        if let Some(r) = self.reading() {
+            copy_to_clipboard(&r.clipboard_text(), &self.measure_box.copy);
         }
-        self.hud_polygons.set_inner_html(&html);
     }
 
     fn pointer_down(&mut self, e: &PointerEvent) {
@@ -285,14 +414,15 @@ impl App {
             && !press.dragging
             && let Some(p) = self.hover()
         {
-            self.drawing.add_vertex(p);
-            self.hud_dirty = true;
+            if self.measure.is_finished() || self.measure.source.is_none() {
+                self.measure_end = None;
+            }
+            self.measure.click(p);
         }
     }
 
     fn key_down(&mut self, e: &KeyboardEvent) {
-        // Leave browser shortcuts alone, and keys aimed at tray controls
-        // (Enter on a focused button must not also close a polygon).
+        // Leave browser shortcuts alone, and keys aimed at controls.
         let on_control = e
             .target()
             .and_then(|t| t.dyn_into::<Element>().ok())
@@ -300,16 +430,11 @@ impl App {
         if on_control || e.ctrl_key() || e.meta_key() || e.alt_key() {
             return;
         }
-        match e.key().as_str() {
-            "Enter" => {
-                self.drawing.close();
-            }
-            "Backspace" => self.drawing.undo_vertex(),
-            "Escape" => self.drawing.cancel(),
-            _ => return,
+        if e.key() == "Escape" {
+            self.measure.clear();
+            self.measure_end = None;
+            e.prevent_default();
         }
-        e.prevent_default();
-        self.hud_dirty = true;
     }
 
     fn wheel(&mut self, e: &WheelEvent) {
@@ -354,18 +479,26 @@ fn write_seed_to_url(seed: u64) {
     }
 }
 
-fn format_km2(m2: f64) -> String {
-    let km2 = (m2 / 1e6).round() as u64;
-    // Thousands separators, e.g. 1,234,567.
-    let digits = km2.to_string();
-    let mut out = String::new();
-    for (i, c) in digits.chars().enumerate() {
-        if i > 0 && (digits.len() - i).is_multiple_of(3) {
-            out.push(',');
-        }
-        out.push(c);
-    }
-    out
+/// Signed elevation like `+1,234 m` or `−4,812 m`.
+fn format_meters(m: f64) -> String {
+    let sign = if m < 0.0 { '\u{2212}' } else { '+' };
+    format!("{sign}{} m", group_thousands(m.abs().round() as u64))
+}
+
+/// Puts `text` on the clipboard and briefly swaps `button`'s icon to a
+/// check mark (see `.copied` in index.html).
+fn copy_to_clipboard(text: &str, button: &Element) {
+    let Some(window) = web_sys::window() else {
+        return;
+    };
+    // The promise rejects only without permission; there is nothing more
+    // useful to do then than skip the check mark.
+    let _ = window.navigator().clipboard().write_text(text);
+    button.set_class_name("copied");
+    let button = button.clone();
+    let reset = Closure::once_into_js(move || button.set_class_name(""));
+    let _ = window
+        .set_timeout_with_callback_and_timeout_and_arguments_0(reset.unchecked_ref(), COPIED_MS);
 }
 
 async fn run() -> Result<(), String> {
@@ -400,29 +533,43 @@ async fn run() -> Result<(), String> {
         .unwrap_or_else(random_seed);
     write_seed_to_url(seed);
     let grid = Grid::new(PLATE_RESOLUTION);
-    let plates = Plates::generate(&grid, seed);
-    let boundaries = Scene::plate_boundaries(&grid, &plates, EARTH_RADIUS_M);
+    let edges = edges(&grid);
+    let world = World::generate(&grid, &edges, seed);
 
-    let renderer = Renderer::new(canvas.clone(), &grid, &plates, &boundaries).await?;
+    let renderer = Renderer::new(canvas.clone(), &grid, &world).await?;
     let aspect = canvas.client_width().max(1) as f64 / canvas.client_height().max(1) as f64;
     let app = Rc::new(RefCell::new(App {
         canvas: canvas.clone(),
         renderer,
         camera: OrbitCamera::over(EARTH_RADIUS_M, START_VIEW, START_ALTITUDE_RADII, aspect),
         map: MapView::new(MapProjection::new(Projection::Globe, START_VIEW), aspect),
-        drawing: Drawing::default(),
+        measure: Measure::default(),
+        measure_end: None,
+        measure_box: MeasureBox {
+            card: element("measure")?,
+            source: element("measure-source")?,
+            bearing: element("measure-bearing")?,
+            distance: element("measure-distance")?,
+            status: element("measure-status")?,
+            copy: element("measure-copy")?,
+        },
         grid,
-        plates,
+        edges,
+        world,
+        arrow_sites: h3_centers(ARROW_RESOLUTION),
         seed,
         layers: 0,
+        color: COLOR_ELEVATION,
         cursor: None,
         press: None,
         hud_cursor: element("hud-cursor")?,
         hud_cell: element("hud-cell")?,
+        hud_crust: element("hud-crust")?,
         world_seed: element("world-seed")?,
-        hud_polygons: element("hud-polygons")?,
+        legend: element("legend")?,
         hud_dirty: true,
     }));
+    app.borrow_mut().update_overlays();
     log::info!("renderer ready");
 
     listen(&canvas, "pointerdown", &app, |app, e: PointerEvent| {
@@ -436,10 +583,6 @@ async fn run() -> Result<(), String> {
     });
     listen(&canvas, "pointerleave", &app, |app, _: PointerEvent| {
         app.cursor = None
-    });
-    listen(&canvas, "dblclick", &app, |app, _: web_sys::MouseEvent| {
-        app.drawing.close();
-        app.hud_dirty = true;
     });
     listen(&canvas, "wheel", &app, |app, e: WheelEvent| app.wheel(&e));
     listen(&window, "keydown", &app, |app, e: KeyboardEvent| {
@@ -457,6 +600,24 @@ async fn run() -> Result<(), String> {
             "change",
             &app,
             move |app, _: web_sys::Event| app.set_layer(bit, input.checked()),
+        );
+    }
+    for (id, mode) in COLOR_CHOICES {
+        let input: HtmlInputElement = element(id)?
+            .dyn_into()
+            .map_err(|_| format!("#{id} is not an input"))?;
+        if input.checked() {
+            app.borrow_mut().set_color(mode);
+        }
+        listen(
+            &input.clone(),
+            "change",
+            &app,
+            move |app, _: web_sys::Event| {
+                if input.checked() {
+                    app.set_color(mode);
+                }
+            },
         );
     }
     for (id, kind) in PROJECTION_CHOICES {
@@ -477,6 +638,10 @@ async fn run() -> Result<(), String> {
             },
         );
     }
+    let copy = element("measure-copy")?;
+    listen(&copy, "click", &app, |app, _: web_sys::Event| {
+        app.copy_measurement()
+    });
     let new_world = element("new-world")?;
     listen(&new_world, "click", &app, |app, _: web_sys::Event| {
         app.set_seed(random_seed())

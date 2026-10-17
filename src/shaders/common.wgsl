@@ -4,7 +4,8 @@ struct Globals {
     light_dir: vec4<f32>,
     // x, y: viewport size in physical pixels; z: planet radius (m); w: line width (px)
     params: vec4<f32>,
-    // x: bitmask of visible LAYER_* flags; y: projection (PROJ_*)
+    // x: bitmask of visible LAYER_* flags; y: projection (PROJ_*);
+    // z: what colors the surface (COLOR_*)
     flags: vec4<u32>,
     // Flat maps: center lon, center lat, Albers parallels 1 and 2 (radians)
     projection: vec4<f32>,
@@ -13,9 +14,13 @@ struct Globals {
     map: vec4<f32>,
 };
 
-const LAYER_PLATES: u32 = 1u;
+// Must match the constants in view.rs.
 const LAYER_BOUNDARIES: u32 = 2u;
 const LAYER_GRATICULE: u32 = 4u;
+const COLOR_PLATES: u32 = 0u;
+const COLOR_ELEVATION: u32 = 1u;
+const COLOR_AGE: u32 = 2u;
+const COLOR_CRUST: u32 = 3u;
 
 // Must match Projection::id in projection.rs, which also holds the
 // reference (and tested) copy of the projection math below.
@@ -211,8 +216,9 @@ fn with_graticule(color: vec3<f32>, p: vec3<f32>) -> vec3<f32> {
     // Equator and prime meridian.
     let major = max(line_at(abs(lat), d_lat), line_at(abs(lon), d_lon) * pole_fade);
 
-    var out = mix(color, vec3<f32>(0.85, 0.9, 1.0), minor * 0.35);
-    out = mix(out, vec3<f32>(1.0, 1.0, 1.0), major * 0.8);
+    // Blends are in linear light, where small amounts already look strong.
+    var out = mix(color, vec3<f32>(0.85, 0.9, 1.0), minor * 0.12);
+    out = mix(out, vec3<f32>(1.0, 1.0, 1.0), major * 0.4);
     return select(color, out, (globals.flags.x & LAYER_GRATICULE) != 0u);
 }
 

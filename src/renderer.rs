@@ -3,9 +3,11 @@ use wgpu::util::DeviceExt;
 
 use crate::grid::Grid;
 use crate::mesh::{CellVertex, Vertex, cell_mesh, cylinder};
-use crate::plates::Plates;
+use crate::palette;
 use crate::projection::Projection;
 use crate::scene::{Column, Scene, Segment};
+use crate::view::{LAYER_BOUNDARIES, LAYER_MANTLE, LAYER_MOTION};
+use crate::world::World;
 
 const DEPTH_FORMAT: wgpu::TextureFormat = wgpu::TextureFormat::Depth32Float;
 const COLUMN_SIDES: u32 = 16;
@@ -13,10 +15,19 @@ const COLUMN_SIDES: u32 = 16;
 const CELL_MAP_SIZE: u32 = 1024;
 const CELL_MAP_FORMAT: wgpu::TextureFormat = wgpu::TextureFormat::R32Uint;
 
-/// Bits of `Globals::layers[0]`; must match common.wgsl.
-pub const LAYER_PLATES: u32 = 1;
-pub const LAYER_BOUNDARIES: u32 = 2;
-pub const LAYER_GRATICULE: u32 = 4;
+/// Line overlays, each drawn when its layer bit is set.
+pub const OVERLAYS: [u32; 3] = [LAYER_BOUNDARIES, LAYER_MOTION, LAYER_MANTLE];
+
+/// Per-cell surface data; matches `CellData` in surface.wgsl.
+#[repr(C)]
+#[derive(Clone, Copy, bytemuck::Pod, bytemuck::Zeroable)]
+struct CellData {
+    plate: u32,
+    elevation_m: f32,
+    /// Seafloor age (Myr), or -1 for continental crust.
+    age_myr: f32,
+    thickness_km: f32,
+}
 
 #[repr(C)]
 #[derive(Clone, Copy, bytemuck::Pod, bytemuck::Zeroable)]
@@ -25,7 +36,8 @@ pub struct Globals {
     pub light_dir: [f32; 4],
     /// Viewport width and height (physical px), planet radius (m), line width (px).
     pub params: [f32; 4],
-    /// Bitmask of visible `LAYER_*` flags, projection id, then unused.
+    /// Bitmask of visible `view::LAYER_*` flags, projection id,
+    /// `view::COLOR_*` mode, then unused.
     pub flags: [u32; 4],
     /// Flat maps: `MapProjection::params`.
     pub projection: [f32; 4],
@@ -121,6 +133,8 @@ pub struct Renderer {
     device: wgpu::Device,
     queue: wgpu::Queue,
     config: wgpu::SurfaceConfiguration,
+    /// sRGB view format that pipelines render to (see `new`).
+    view_format: wgpu::TextureFormat,
     depth_view: wgpu::TextureView,
     globals_buffer: wgpu::Buffer,
     globals_bind_group: wgpu::BindGroup,
@@ -128,9 +142,10 @@ pub struct Renderer {
     globe: GpuMesh,
     map_pipeline: wgpu::RenderPipeline,
     cell_map: wgpu::TextureView,
-    plate_layout: wgpu::BindGroupLayout,
-    plate_bind_group: wgpu::BindGroup,
-    plate_boundaries: InstanceBuffer,
+    surface_layout: wgpu::BindGroupLayout,
+    surface_bind_group: wgpu::BindGroup,
+    /// Line overlays in the order of `OVERLAYS`.
+    overlays: Vec<InstanceBuffer>,
     column_pipeline: wgpu::RenderPipeline,
     column_mesh: GpuMesh,
     columns: InstanceBuffer,
@@ -142,8 +157,7 @@ impl Renderer {
     pub async fn new(
         canvas: HtmlCanvasElement,
         grid: &Grid,
-        plates: &Plates,
-        boundaries: &[Segment],
+        world: &World,
     ) -> Result<Self, String> {
         let instance = wgpu::Instance::new(wgpu::InstanceDescriptor {
             backends: wgpu::Backends::BROWSER_WEBGPU,
@@ -167,20 +181,29 @@ impl Renderer {
 
         let (width, height) = canvas_size(&canvas);
         let caps = surface.get_capabilities(&adapter);
-        let format = caps
+        // Shaders output linear color. WebGPU canvases are never sRGB
+        // (bgra8unorm and friends), so render through an sRGB view of the
+        // canvas, which encodes linear to sRGB on write. Without it every
+        // color comes out too dark.
+        let canvas_format = caps
             .formats
             .iter()
             .copied()
             .find(|f| f.is_srgb())
             .unwrap_or(caps.formats[0]);
+        let format = canvas_format.add_srgb_suffix();
         let config = wgpu::SurfaceConfiguration {
             usage: wgpu::TextureUsages::RENDER_ATTACHMENT,
-            format,
+            format: canvas_format,
             width,
             height,
             present_mode: wgpu::PresentMode::Fifo,
             alpha_mode: caps.alpha_modes[0],
-            view_formats: vec![],
+            view_formats: if format == canvas_format {
+                vec![]
+            } else {
+                vec![format]
+            },
             desired_maximum_frame_latency: 2,
             color_space: Default::default(),
         };
@@ -229,11 +252,12 @@ impl Renderer {
             },
             count: None,
         };
-        let plate_layout = device.create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor {
-            label: Some("plates"),
+        let surface_layout = device.create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor {
+            label: Some("surface"),
             entries: &[
                 storage_entry(0),
                 storage_entry(1),
+                storage_entry(3),
                 wgpu::BindGroupLayoutEntry {
                     binding: 2,
                     visibility: wgpu::ShaderStages::FRAGMENT,
@@ -248,7 +272,7 @@ impl Renderer {
         });
         let globe_layout = device.create_pipeline_layout(&wgpu::PipelineLayoutDescriptor {
             label: Some("globe"),
-            bind_group_layouts: &[Some(&bind_group_layout), Some(&plate_layout)],
+            bind_group_layouts: &[Some(&bind_group_layout), Some(&surface_layout)],
             immediate_size: 0,
         });
 
@@ -332,16 +356,22 @@ impl Renderer {
         let globe = GpuMesh::new(&device, "globe", &globe_vertices, &globe_indices);
         let cell_map = bake_cell_map(&device, &queue, &globe, cell_vertex_layout);
         let column = cylinder(COLUMN_SIDES);
-        let mut plate_boundaries = InstanceBuffer::new(&device, "plate boundaries");
-        plate_boundaries.write(&device, &queue, boundaries);
         Ok(Self {
             depth_view: create_depth_view(&device, width, height),
             globe,
-            plate_bind_group: create_plate_bind_group(&device, &plate_layout, plates, &cell_map),
+            surface_bind_group: create_surface_bind_group(
+                &device,
+                &surface_layout,
+                world,
+                &cell_map,
+            ),
             cell_map,
             map_pipeline,
-            plate_layout,
-            plate_boundaries,
+            surface_layout,
+            overlays: OVERLAYS
+                .iter()
+                .map(|_| InstanceBuffer::new(&device, "overlay"))
+                .collect(),
             column_mesh: GpuMesh::new(&device, "column", &column.vertices, &column.indices),
             columns: InstanceBuffer::new(&device, "column instances"),
             segments: InstanceBuffer::new(&device, "segment instances"),
@@ -350,6 +380,7 @@ impl Renderer {
             device,
             queue,
             config,
+            view_format: format,
             globals_buffer,
             globals_bind_group,
             globe_pipeline,
@@ -371,12 +402,18 @@ impl Renderer {
         (width, height)
     }
 
-    /// Replace the plate data, e.g. after regenerating with a new seed.
-    pub fn set_plates(&mut self, plates: &Plates, boundaries: &[Segment]) {
-        self.plate_bind_group =
-            create_plate_bind_group(&self.device, &self.plate_layout, plates, &self.cell_map);
-        self.plate_boundaries
-            .write(&self.device, &self.queue, boundaries);
+    /// Replace the per-cell surface data, e.g. after regenerating.
+    pub fn set_world(&mut self, world: &World) {
+        self.surface_bind_group =
+            create_surface_bind_group(&self.device, &self.surface_layout, world, &self.cell_map);
+    }
+
+    /// Replace the lines of the overlay drawn for `layer` (one of
+    /// `OVERLAYS`).
+    pub fn set_overlay(&mut self, layer: u32, segments: &[Segment]) {
+        if let Some(i) = OVERLAYS.iter().position(|&l| l == layer) {
+            self.overlays[i].write(&self.device, &self.queue, segments);
+        }
     }
 
     pub fn render(&mut self, globals: &Globals, scene: &Scene) {
@@ -396,7 +433,10 @@ impl Renderer {
             }
             _ => return,
         };
-        let view = frame.texture.create_view(&Default::default());
+        let view = frame.texture.create_view(&wgpu::TextureViewDescriptor {
+            format: Some(self.view_format),
+            ..Default::default()
+        });
         let mut encoder = self.device.create_command_encoder(&Default::default());
         {
             let mut pass = encoder.begin_render_pass(&wgpu::RenderPassDescriptor {
@@ -429,7 +469,7 @@ impl Renderer {
             });
             pass.set_bind_group(0, &self.globals_bind_group, &[]);
 
-            pass.set_bind_group(1, &self.plate_bind_group, &[]);
+            pass.set_bind_group(1, &self.surface_bind_group, &[]);
             if globals.flags[1] == Projection::Globe.id() {
                 pass.set_pipeline(&self.globe_pipeline);
                 pass.set_vertex_buffer(0, self.globe.vertices.slice(..));
@@ -453,9 +493,11 @@ impl Renderer {
 
             // Lines last: they test depth but don't write it, and blend.
             pass.set_pipeline(&self.line_pipeline);
-            if globals.flags[0] & LAYER_BOUNDARIES != 0 && self.plate_boundaries.count > 0 {
-                pass.set_vertex_buffer(0, self.plate_boundaries.buffer.slice(..));
-                pass.draw(0..6, 0..self.plate_boundaries.count);
+            for (layer, lines) in OVERLAYS.iter().zip(&self.overlays) {
+                if globals.flags[0] & layer != 0 && lines.count > 0 {
+                    pass.set_vertex_buffer(0, lines.buffer.slice(..));
+                    pass.draw(0..6, 0..lines.count);
+                }
             }
             if self.segments.count > 0 {
                 pass.set_vertex_buffer(0, self.segments.buffer.slice(..));
@@ -515,13 +557,27 @@ fn create_pipeline(
     })
 }
 
-fn create_plate_bind_group(
+fn create_surface_bind_group(
     device: &wgpu::Device,
     layout: &wgpu::BindGroupLayout,
-    plates: &Plates,
+    world: &World,
     cell_map: &wgpu::TextureView,
 ) -> wgpu::BindGroup {
-    let colors: Vec<[f32; 4]> = plates
+    let crust = &world.crust;
+    let cells: Vec<CellData> = (0..crust.kind.len())
+        .map(|c| CellData {
+            plate: world.plates.cell_plate[c],
+            elevation_m: crust.elevation_m[c] as f32,
+            age_myr: if crust.kind[c].is_continental() {
+                -1.0
+            } else {
+                crust.age_myr[c] as f32
+            },
+            thickness_km: crust.thickness_km[c] as f32,
+        })
+        .collect();
+    let colors: Vec<[f32; 4]> = world
+        .plates
         .plates
         .iter()
         .map(|p| [p.color[0], p.color[1], p.color[2], 1.0])
@@ -533,15 +589,16 @@ fn create_plate_bind_group(
             usage: wgpu::BufferUsages::STORAGE,
         })
     };
-    let cell_plate = storage("cell plate", bytemuck::cast_slice(&plates.cell_plate));
+    let cell_data = storage("cells", bytemuck::cast_slice(&cells));
     let plate_color = storage("plate color", bytemuck::cast_slice(&colors));
+    let palettes = storage("palettes", bytemuck::cast_slice(&palette::gpu_table()));
     device.create_bind_group(&wgpu::BindGroupDescriptor {
-        label: Some("plates"),
+        label: Some("surface"),
         layout,
         entries: &[
             wgpu::BindGroupEntry {
                 binding: 0,
-                resource: cell_plate.as_entire_binding(),
+                resource: cell_data.as_entire_binding(),
             },
             wgpu::BindGroupEntry {
                 binding: 1,
@@ -550,6 +607,10 @@ fn create_plate_bind_group(
             wgpu::BindGroupEntry {
                 binding: 2,
                 resource: wgpu::BindingResource::TextureView(cell_map),
+            },
+            wgpu::BindGroupEntry {
+                binding: 3,
+                resource: palettes.as_entire_binding(),
             },
         ],
     })

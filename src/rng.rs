@@ -3,6 +3,16 @@
 //! Kept in-house rather than using `rand` so a seed produces the same world on
 //! every platform and across dependency upgrades.
 
+/// Each part of world generation draws from its own PCG stream of the same
+/// seed, so changing how one part uses random numbers never moves another.
+#[derive(Clone, Copy, Debug)]
+pub enum Stream {
+    Plates = 1,
+    Continents = 2,
+    Mantle = 3,
+    Hotspots = 4,
+}
+
 pub struct Pcg32 {
     state: u64,
     inc: u64,
@@ -11,10 +21,24 @@ pub struct Pcg32 {
 impl Pcg32 {
     const MULTIPLIER: u64 = 6_364_136_223_846_793_005;
 
+    /// A generator on the default stream; world generation uses
+    /// [`Pcg32::for_part`] instead.
+    #[cfg(test)]
     pub fn new(seed: u64) -> Self {
+        Self::with_stream(seed, 0xda3e_39cb_94b9_5bdb)
+    }
+
+    /// The generator for one part of world generation.
+    pub fn for_part(seed: u64, part: Stream) -> Self {
+        Self::with_stream(seed, part as u64)
+    }
+
+    /// PCG's stream selection: generators with different `stream`s produce
+    /// unrelated sequences from the same seed.
+    fn with_stream(seed: u64, stream: u64) -> Self {
         let mut rng = Self {
             state: 0,
-            inc: (0xda3e_39cb_94b9_5bdb << 1) | 1,
+            inc: (stream << 1) | 1,
         };
         rng.next_u32();
         rng.state = rng.state.wrapping_add(seed);
@@ -60,6 +84,17 @@ mod tests {
         let mut rng = Pcg32::new(42);
         let got: Vec<u32> = (0..3).map(|_| rng.next_u32()).collect();
         assert_eq!(got, [1_898_997_482, 1_014_631_766, 4_096_008_554]);
+    }
+
+    #[test]
+    fn streams_are_independent() {
+        let mut a = Pcg32::for_part(42, Stream::Plates);
+        let mut b = Pcg32::for_part(42, Stream::Hotspots);
+        let (xa, xb): (Vec<u32>, Vec<u32>) = (0..8).map(|_| (a.next_u32(), b.next_u32())).unzip();
+        assert_ne!(xa, xb);
+        // Same part, same seed: same sequence.
+        let mut c = Pcg32::for_part(42, Stream::Plates);
+        assert_eq!(xa, (0..8).map(|_| c.next_u32()).collect::<Vec<_>>());
     }
 
     #[test]

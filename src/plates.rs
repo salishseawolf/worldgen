@@ -12,7 +12,8 @@ use std::collections::{BTreeSet, BinaryHeap};
 use glam::DVec3;
 
 use crate::grid::Grid;
-use crate::rng::Pcg32;
+use crate::palette::srgb_to_linear;
+use crate::rng::{Pcg32, Stream};
 
 pub const MAJOR_PLATES: usize = 8;
 pub const MINOR_PLATES: usize = 10;
@@ -28,34 +29,13 @@ const RESEED_ROUNDS: usize = 8;
 const ROUGHNESS: f64 = 1.0;
 /// Neighbor-averaging passes for the coarse and fine noise layers.
 const NOISE_BLUR: (usize, usize) = (40, 8);
-const CONTINENTAL_CHANCE: f64 = 0.4;
-/// Plate angular speed range, radians per million years (about 1 degree/Myr
-/// is fast on Earth).
-const OMEGA_RANGE: (f64, f64) = (0.003, 0.018);
-
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub enum Crust {
-    Continental,
-    Oceanic,
-}
-
-impl Crust {
-    pub fn name(self) -> &'static str {
-        match self {
-            Crust::Continental => "continental",
-            Crust::Oceanic => "oceanic",
-        }
-    }
-}
 
 #[derive(Clone, Debug)]
 pub struct Plate {
-    pub kind: Crust,
     /// Linear RGB.
     pub color: [f32; 3],
     /// Angular velocity (Euler pole times rate, rad/Myr): a surface point
-    /// `p` moves at `omega.cross(p)`. A random placeholder until mantle
-    /// currents drive it.
+    /// `p` moves at `omega.cross(p)`. Zero until `tectonics` solves it.
     pub omega: DVec3,
 }
 
@@ -74,8 +54,22 @@ impl Plate {
 }
 
 impl Plates {
+    /// Plates with minor plates seeded on any boundary between majors.
+    #[cfg(test)]
     pub fn generate(grid: &Grid, seed: u64) -> Self {
-        let mut rng = Pcg32::new(seed);
+        Self::generate_with(grid, seed, |majors| boundary_cells(grid, majors, None))
+    }
+
+    /// Like `generate`, but `minor_sites` picks where minor plates may start,
+    /// given the plate id of each cell when only the majors exist. It should
+    /// return cells on boundaries between majors (so minors border at least
+    /// two plates); if it returns none, any such boundary is used.
+    pub fn generate_with(
+        grid: &Grid,
+        seed: u64,
+        minor_sites: impl FnOnce(&[u32]) -> Vec<u32>,
+    ) -> Self {
+        let mut rng = Pcg32::for_part(seed, Stream::Plates);
         let cost = crossing_cost(grid, &mut rng);
         let speeds: Vec<f64> = (0..MAJOR_PLATES + MINOR_PLATES)
             .map(|i| {
@@ -104,16 +98,20 @@ impl Plates {
         // Minor plates on the boundaries between major plates, the way
         // Earth's microplates sit between larger ones. A seed there grows
         // into both sides, so it borders at least two plates.
-        let majors = flood_fill(grid, &seeds, &speeds, &cost);
+        let (majors, _) = flood_fill(grid, &seeds, &speeds, &cost);
+        let mut sites = minor_sites(&majors);
+        if sites.is_empty() {
+            sites = boundary_cells(grid, &majors, None);
+        }
         place_seeds(
             grid,
             &mut rng,
-            &boundary_cells(grid, &majors, None),
+            &sites,
             &mut seeds,
             MINOR_PLATES,
             MINOR_SPACING * even_spacing(MAJOR_PLATES),
         );
-        let mut cell_plate = flood_fill(grid, &seeds, &speeds, &cost);
+        let (mut cell_plate, _) = flood_fill(grid, &seeds, &speeds, &cost);
 
         // A plate surrounded by a single other plate is not realistic. Move
         // its seed onto a boundary between other plates and grow again; if
@@ -129,23 +127,15 @@ impl Plates {
                     seeds[plate] = candidates[(rng.next_f64() * candidates.len() as f64) as usize];
                 }
             }
-            cell_plate = flood_fill(grid, &seeds, &speeds, &cost);
+            cell_plate = flood_fill(grid, &seeds, &speeds, &cost).0;
         }
         let count = merge_enclosed(grid, &mut cell_plate, seeds.len());
 
         let hue_offset = rng.next_f64();
         let plates: Vec<Plate> = (0..count)
-            .map(|i| {
-                let kind = if rng.next_f64() < CONTINENTAL_CHANCE {
-                    Crust::Continental
-                } else {
-                    Crust::Oceanic
-                };
-                Plate {
-                    kind,
-                    color: plate_color(i, hue_offset, kind),
-                    omega: rng.unit_vector() * rng.range(OMEGA_RANGE.0, OMEGA_RANGE.1),
-                }
+            .map(|i| Plate {
+                color: plate_color(i, hue_offset),
+                omega: DVec3::ZERO,
             })
             .collect();
         Self { cell_plate, plates }
@@ -187,7 +177,7 @@ fn place_seeds(
 
 /// Cells with a neighbor on another plate. With `exclude`, only boundaries
 /// between other plates: neither the cell nor any neighbor is on `exclude`.
-fn boundary_cells(grid: &Grid, cell_plate: &[u32], exclude: Option<u32>) -> Vec<u32> {
+pub fn boundary_cells(grid: &Grid, cell_plate: &[u32], exclude: Option<u32>) -> Vec<u32> {
     (0..grid.len() as u32)
         .filter(|&c| {
             let plate = cell_plate[c as usize];
@@ -258,7 +248,7 @@ fn crossing_cost(grid: &Grid, rng: &mut Pcg32) -> Vec<f64> {
 }
 
 /// White noise averaged over neighbors `passes` times, rescaled to [-1, 1].
-fn smooth_noise(grid: &Grid, rng: &mut Pcg32, passes: usize) -> Vec<f64> {
+pub fn smooth_noise(grid: &Grid, rng: &mut Pcg32, passes: usize) -> Vec<f64> {
     let mut values: Vec<f64> = (0..grid.len()).map(|_| rng.range(-1.0, 1.0)).collect();
     for _ in 0..passes {
         values = (0..grid.len() as u32)
@@ -309,9 +299,16 @@ impl Ord for Front {
 
 /// Every cell goes to the plate that reaches it first. A cell is only ever
 /// claimed from a neighbor of the same plate, so every plate is connected.
-fn flood_fill(grid: &Grid, seeds: &[u32], speeds: &[f64], cost: &[f64]) -> Vec<u32> {
+/// Also returns the cost at which each cell was claimed, its arrival time.
+pub fn flood_fill(
+    grid: &Grid,
+    seeds: &[u32],
+    speeds: &[f64],
+    cost: &[f64],
+) -> (Vec<u32>, Vec<f64>) {
     const UNCLAIMED: u32 = u32::MAX;
     let mut owner = vec![UNCLAIMED; grid.len()];
+    let mut arrival = vec![0.0; grid.len()];
     let mut heap: BinaryHeap<Front> = seeds
         .iter()
         .enumerate()
@@ -331,6 +328,7 @@ fn flood_fill(grid: &Grid, seeds: &[u32], speeds: &[f64], cost: &[f64]) -> Vec<u
             continue;
         }
         owner[cell as usize] = plate;
+        arrival[cell as usize] = c;
         let here = grid.centers[cell as usize];
         for next in grid.neighbors_of(cell) {
             if owner[next as usize] == UNCLAIMED {
@@ -345,17 +343,13 @@ fn flood_fill(grid: &Grid, seeds: &[u32], speeds: &[f64], cost: &[f64]) -> Vec<u
             }
         }
     }
-    owner
+    (owner, arrival)
 }
 
-/// Distinct hues by golden-angle stepping; oceanic plates are darker.
-fn plate_color(index: usize, hue_offset: f64, kind: Crust) -> [f32; 3] {
+/// Distinct hues by golden-angle stepping.
+fn plate_color(index: usize, hue_offset: f64) -> [f32; 3] {
     let hue = (hue_offset + index as f64 * 0.618_033_988_75).fract();
-    let (saturation, value) = match kind {
-        Crust::Continental => (0.45, 0.85),
-        Crust::Oceanic => (0.55, 0.55),
-    };
-    hsv_to_srgb(hue, saturation, value).map(|c| srgb_to_linear(c) as f32)
+    hsv_to_srgb(hue, 0.5, 0.75).map(|c| srgb_to_linear(c) as f32)
 }
 
 fn hsv_to_srgb(h: f64, s: f64, v: f64) -> [f64; 3] {
@@ -364,14 +358,6 @@ fn hsv_to_srgb(h: f64, s: f64, v: f64) -> [f64; 3] {
         v - v * s * k.min(4.0 - k).clamp(0.0, 1.0)
     };
     [f(5.0), f(3.0), f(1.0)]
-}
-
-fn srgb_to_linear(c: f64) -> f64 {
-    if c <= 0.04045 {
-        c / 12.92
-    } else {
-        ((c + 0.055) / 1.055).powf(2.4)
-    }
 }
 
 #[cfg(test)]

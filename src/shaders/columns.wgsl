@@ -31,6 +31,6 @@ fn vs_main(
 
 @fragment
 fn fs_main(in: VertexOut) -> @location(0) vec4<f32> {
-    let shade = select(0.35 + 0.65 * lambert(in.normal), 1.0, is_map());
+    let shade = select(0.1 + 0.9 * lambert(in.normal), 1.0, is_map());
     return vec4<f32>(in.color.rgb * shade, in.color.a);
 }
