@@ -40,14 +40,18 @@ pub const SLAB_PULL: f64 = 0.4;
 const ECLOGITE_EXCESS: f64 = 200.0;
 /// Where both sides' columns are at least this buoyant (kg/m³·km, see
 /// `Column::buoyancy`: about 15 km or more of light crust), neither sinks.
-const COLLISION_BUOYANCY: f64 = 6000.0;
+pub const COLLISION_BUOYANCY: f64 = 6000.0;
 const RIDGE_PUSH: f64 = 0.04;
 /// Overriding plates are drawn gently toward the trench.
 const TRENCH_SUCTION: f64 = 0.06;
 /// Boundaries resist motion (fault friction, coupling to the neighbor):
-/// extra drag per unit edge length, stronger where continents collide.
+/// extra drag per unit edge length.
 const EDGE_DRAG: f64 = 3.0;
-const COLLISION_DRAG: f64 = 6.0;
+/// Where continents collide, neither sinks, so the boundary resists the
+/// plates closing on each other: drag per unit edge length on their
+/// relative motion across it. Strong enough that colliding plates slow and
+/// all but lock, as India slowed against Asia (Molnar & Stock 2009).
+pub const COLLISION_COUPLING: f64 = 600.0;
 /// Boundary direction is averaged over edges this close (radians, about
 /// 250 km), smoothing out the zigzag of hexagon sides.
 const NORMAL_SMOOTHING: f64 = 0.04;
@@ -136,10 +140,6 @@ impl Boundary {
 
 /// Angular velocity (rad/Myr) of each plate from the torque balance on it,
 /// rescaled so the RMS surface speed is [`PLATE_RMS_CM_YEAR`].
-///
-/// For plate cells `p` with drag `k` over mantle flow `v`, basal drag
-/// torque `Σ k p × (v − ω × p)` balances boundary torques `T`:
-/// `Σ k (I − p pᵀ) ω = Σ k p × v + T`, a 3×3 solve per plate.
 #[allow(clippy::too_many_arguments)]
 pub fn solve_motion(
     grid: &Grid,
@@ -150,58 +150,163 @@ pub fn solve_motion(
     mantle: &[DVec3],
     boundaries: &[Boundary],
 ) -> Vec<DVec3> {
-    let mut lhs = vec![DMat3::ZERO; plate_count];
-    let mut rhs = vec![DVec3::ZERO; plate_count];
+    solve_motion_scaled(
+        grid,
+        edges,
+        cell_plate,
+        plate_count,
+        columns,
+        mantle,
+        boundaries,
+        None,
+    )
+    .0
+}
+
+/// As [`solve_motion`], but with the torque balance's result multiplied by
+/// `scale` if given (to keep a world's speeds in the same units as it
+/// changes), or by whatever gives the RMS speed otherwise. Returns the
+/// velocities and the scale used.
+///
+/// For plate cells `p` with drag `k` over mantle flow `v`, basal drag
+/// torque `Σ k p × (v − ω × p)` balances boundary torques `T`:
+/// `Σ k (I − p pᵀ) ω = Σ k p × v + T`, a 3×3 solve per plate.
+#[allow(clippy::too_many_arguments)]
+pub fn solve_motion_scaled(
+    grid: &Grid,
+    edges: &[Edge],
+    cell_plate: &[u32],
+    plate_count: usize,
+    columns: &[Column],
+    mantle: &[DVec3],
+    boundaries: &[Boundary],
+    scale: Option<f64>,
+) -> (Vec<DVec3>, f64) {
+    // One 3×3 block per plate pair: diagonal blocks hold each plate's own
+    // drag, off-diagonal ones the collision coupling between two plates.
+    let n = plate_count;
+    let mut lhs = vec![DMat3::ZERO; n * n];
+    let mut rhs = vec![DVec3::ZERO; n];
+    let tangent = |p: DVec3| DMat3::IDENTITY - DMat3::from_cols(p * p.x, p * p.y, p * p.z);
     for (cell, &p) in grid.centers.iter().enumerate() {
         let plate = cell_plate[cell] as usize;
         let k = keel_drag(&columns[cell]);
-        lhs[plate] += (DMat3::IDENTITY - DMat3::from_cols(p * p.x, p * p.y, p * p.z)) * k;
+        lhs[plate * n + plate] += tangent(p) * k;
         rhs[plate] += p.cross(mantle[cell]) * k;
     }
 
     let cell_edge = cell_edge(grid);
     for b in boundaries {
         let e = &edges[b.edge as usize];
+        let length = e.length / cell_edge;
+        let (pa, pb) = (
+            cell_plate[e.a as usize] as usize,
+            cell_plate[e.b as usize] as usize,
+        );
         // Resistance along the edge, on both plates.
-        let drag = if b.kind == BoundaryKind::Collision {
-            COLLISION_DRAG
-        } else {
-            EDGE_DRAG
-        } * e.length
-            / cell_edge;
-        let m = e.mid;
-        for cell in [e.a, e.b] {
-            lhs[cell_plate[cell as usize] as usize] +=
-                (DMat3::IDENTITY - DMat3::from_cols(m * m.x, m * m.y, m * m.z)) * drag;
+        for p in [pa, pb] {
+            lhs[p * n + p] += tangent(e.mid) * (EDGE_DRAG * length);
+        }
+        // Where both sides are too buoyant to sink, the plates can slide
+        // past or pull apart but not close: this holds even once they've
+        // locked and the edge no longer reads as a collision.
+        let locked = b.kind != BoundaryKind::Rift
+            && columns[e.a as usize].buoyancy() >= COLLISION_BUOYANCY
+            && columns[e.b as usize].buoyancy() >= COLLISION_BUOYANCY;
+        if locked && pa != pb {
+            // Closing speed across the edge is u · (ω_a − ω_b) with
+            // u = n × m; the drag on it couples the two plates.
+            let u = b.normal.cross(e.mid);
+            let k = DMat3::from_cols(u * u.x, u * u.y, u * u.z) * (COLLISION_COUPLING * length);
+            lhs[pa * n + pa] += k;
+            lhs[pb * n + pb] += k;
+            lhs[pa * n + pb] -= k;
+            lhs[pb * n + pa] -= k;
         }
     }
     for f in boundary_forces(grid, edges, boundaries, columns) {
         rhs[cell_plate[f.cell as usize] as usize] += f.at.cross(f.dir * f.strength * f.length);
     }
 
-    let mut omega: Vec<DVec3> = lhs
-        .iter()
-        .zip(&rhs)
-        .map(|(m, r)| {
-            if m.determinant().abs() < 1e-9 {
-                DVec3::ZERO
-            } else {
-                m.inverse() * *r
+    let mut omega = solve_blocks(n, &lhs, &rhs);
+    let scale = scale.unwrap_or_else(|| {
+        let mean_sq: f64 = grid
+            .centers
+            .iter()
+            .enumerate()
+            .map(|(cell, &p)| omega[cell_plate[cell] as usize].cross(p).length_squared())
+            .sum::<f64>()
+            / grid.len() as f64;
+        if mean_sq > 0.0 {
+            PLATE_RMS_CM_YEAR * CM_PER_YEAR / mean_sq.sqrt()
+        } else {
+            1.0
+        }
+    });
+    omega.iter_mut().for_each(|w| *w *= scale);
+    (omega, scale)
+}
+
+/// Solves the block system `Σ_q lhs[p][q] ω_q = rhs[p]` by Gaussian
+/// elimination with partial pivoting. Plates with no cells (all zero rows)
+/// come out still.
+fn solve_blocks(n: usize, lhs: &[DMat3], rhs: &[DVec3]) -> Vec<DVec3> {
+    let size = 3 * n;
+    let mut a = vec![0.0f64; size * (size + 1)];
+    let at = |r: usize, c: usize| r * (size + 1) + c;
+    for p in 0..n {
+        for q in 0..n {
+            let m = lhs[p * n + q];
+            for i in 0..3 {
+                for j in 0..3 {
+                    a[at(3 * p + i, 3 * q + j)] = m.col(j)[i];
+                }
             }
-        })
-        .collect();
-    let mean_sq: f64 = grid
-        .centers
-        .iter()
-        .enumerate()
-        .map(|(cell, &p)| omega[cell_plate[cell] as usize].cross(p).length_squared())
-        .sum::<f64>()
-        / grid.len() as f64;
-    if mean_sq > 0.0 {
-        let scale = PLATE_RMS_CM_YEAR * CM_PER_YEAR / mean_sq.sqrt();
-        omega.iter_mut().for_each(|w| *w *= scale);
+        }
+        for i in 0..3 {
+            a[at(3 * p + i, size)] = rhs[p][i];
+        }
     }
-    omega
+    let scale = a.iter().fold(0.0f64, |m, v| m.max(v.abs())).max(1.0);
+    for col in 0..size {
+        let pivot = (col..size)
+            .max_by(|&x, &y| a[at(x, col)].abs().total_cmp(&a[at(y, col)].abs()))
+            .unwrap();
+        if a[at(pivot, col)].abs() < 1e-12 * scale {
+            // A free direction (an empty plate): leave it at zero.
+            for c in 0..=size {
+                a[at(col, c)] = 0.0;
+            }
+            continue;
+        }
+        if pivot != col {
+            for c in 0..=size {
+                a.swap(at(pivot, c), at(col, c));
+            }
+        }
+        for r in 0..size {
+            if r != col {
+                let f = a[at(r, col)] / a[at(col, col)];
+                if f != 0.0 {
+                    for c in col..=size {
+                        a[at(r, c)] -= f * a[at(col, c)];
+                    }
+                }
+            }
+        }
+    }
+    (0..n)
+        .map(|p| {
+            DVec3::from_array([0, 1, 2].map(|i| {
+                let d = a[at(3 * p + i, 3 * p + i)];
+                if d.abs() < 1e-12 * scale {
+                    0.0
+                } else {
+                    a[at(3 * p + i, size)] / d
+                }
+            }))
+        })
+        .collect()
 }
 
 /// Basal drag of a column: deeper roots (keels) resist the mantle more.

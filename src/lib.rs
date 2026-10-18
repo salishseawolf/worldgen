@@ -20,7 +20,10 @@ mod projection;
 mod renderer;
 mod rng;
 mod scene;
+#[cfg(target_arch = "wasm32")]
+mod sim;
 mod tectonics;
+mod timestep;
 mod view;
 #[cfg(target_arch = "wasm32")]
 mod web;

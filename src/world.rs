@@ -26,7 +26,7 @@ use crate::plates::{Plate, Plates};
 use crate::rng::{Pcg32, Stream};
 use crate::tectonics::{
     Boundary, BoundaryForce, BoundaryKind, DEFAULT_OCEAN_AGE_MYR, Edge, RADIUS_KM, boundary_forces,
-    classify, flood, ocean_ages, solve_motion,
+    classify, flood, ocean_ages, solve_motion, solve_motion_scaled,
 };
 
 /// Rounds of classify, date, re-solve.
@@ -80,11 +80,11 @@ const RIFT_WIDTH_KM: f64 = 60.0;
 /// Ocean sediment: slow open-ocean settling (km per Myr of seafloor age)
 /// plus thick wedges off continents (GlobSed: thickness grows with age and
 /// near land).
-const PELAGIC_KM_PER_MYR: f64 = 0.003;
+pub const PELAGIC_KM_PER_MYR: f64 = 0.003;
 const MARGIN_SEDIMENT_KM: f64 = 2.5;
 const MARGIN_WIDTH_KM: f64 = 250.0;
 /// Seafloor with less sediment than this shows its basalt.
-const BARE_SEAFLOOR_KM: f64 = 0.05;
+pub const BARE_SEAFLOOR_KM: f64 = 0.05;
 /// Continental ground above this has had its sedimentary cover eroded off,
 /// exposing granite and gneiss basement.
 const EXPOSED_BASEMENT_M: f64 = 1200.0;
@@ -141,6 +141,11 @@ pub struct Crust {
 
 pub struct World {
     pub plates: Plates,
+    /// Mantle flow under each cell, which drags the plates.
+    pub flow: Vec<DVec3>,
+    /// Converts the motion solve's torque balance to plate speeds; fixed at
+    /// generation so later solves keep the same units.
+    pub motion_scale: f64,
     pub crust: Crust,
     pub mantle: MantleFlow,
     pub boundaries: Vec<Boundary>,
@@ -154,6 +159,9 @@ pub struct World {
     pub hotspot_marks: Vec<Option<HotspotMark>>,
     /// Elevation (m) each cell gains or loses from vertical mantle flow.
     pub dynamic_m: Vec<f64>,
+    /// Hotspot swell (m) at each cell: fixed over the plumes, unlike the
+    /// volcanoes, which move with the crust.
+    pub swell_m: Vec<f64>,
 }
 
 /// A hotspot volcano on a cell.
@@ -371,6 +379,7 @@ impl World {
 
         let mut omega = solve_motion(grid, edges, &plates.cell_plate, count, &columns, &flow, &[]);
         let mut boundaries = classify(edges, &plates.cell_plate, &omega, &kind, &columns);
+        let mut motion_scale = 1.0;
         for round in 0..MOTION_ROUNDS {
             age = ocean_ages(grid, edges, &plates.cell_plate, &kind, &boundaries);
             columns = base_columns(&age);
@@ -387,7 +396,7 @@ impl World {
                 }
                 flow = mantle.normalize_and_sample(grid);
             }
-            omega = solve_motion(
+            (omega, motion_scale) = solve_motion_scaled(
                 grid,
                 edges,
                 &plates.cell_plate,
@@ -395,6 +404,7 @@ impl World {
                 &columns,
                 &flow,
                 &boundaries,
+                None,
             );
             boundaries = classify(edges, &plates.cell_plate, &omega, &kind, &columns);
         }
@@ -450,6 +460,9 @@ impl World {
             boundaries,
             forces,
             dynamic_m,
+            swell_m: relief.swell,
+            flow,
+            motion_scale,
         }
     }
 }
@@ -555,12 +568,17 @@ fn hotspot_relief(
     }
     HotspotRelief {
         elevation: swell.iter().zip(&volcano).map(|(s, v)| s + v).collect(),
+        swell,
         marks,
     }
 }
 
 struct HotspotRelief {
+    /// Swell plus volcanoes (m).
     elevation: Vec<f64>,
+    /// The swell alone: it stays over the plume as the plate moves on,
+    /// while the volcanoes ride along with the crust.
+    swell: Vec<f64>,
     marks: Vec<Option<HotspotMark>>,
 }
 

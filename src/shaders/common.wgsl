@@ -227,15 +227,3 @@ fn with_graticule(color: vec3<f32>, p: vec3<f32>) -> vec3<f32> {
     out = mix(out, vec3<f32>(1.0, 1.0, 1.0), major * 0.4);
     return select(color, out, (globals.flags.x & LAYER_GRATICULE) != 0u);
 }
-
-// Cube-map faces used to store per-pixel cell ids: columns are the face's
-// right, up and forward axes. cells.wgsl renders with these and
-// surface.wgsl reads back with them.
-const CUBE_FACES = array<mat3x3<f32>, 6>(
-    mat3x3<f32>(vec3<f32>(0.0, 0.0, -1.0), vec3<f32>(0.0, 1.0, 0.0), vec3<f32>(1.0, 0.0, 0.0)),
-    mat3x3<f32>(vec3<f32>(0.0, 0.0, 1.0), vec3<f32>(0.0, 1.0, 0.0), vec3<f32>(-1.0, 0.0, 0.0)),
-    mat3x3<f32>(vec3<f32>(1.0, 0.0, 0.0), vec3<f32>(0.0, 0.0, -1.0), vec3<f32>(0.0, 1.0, 0.0)),
-    mat3x3<f32>(vec3<f32>(1.0, 0.0, 0.0), vec3<f32>(0.0, 0.0, 1.0), vec3<f32>(0.0, -1.0, 0.0)),
-    mat3x3<f32>(vec3<f32>(1.0, 0.0, 0.0), vec3<f32>(0.0, 1.0, 0.0), vec3<f32>(0.0, 0.0, 1.0)),
-    mat3x3<f32>(vec3<f32>(-1.0, 0.0, 0.0), vec3<f32>(0.0, 1.0, 0.0), vec3<f32>(0.0, 0.0, -1.0)),
-);

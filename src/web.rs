@@ -21,7 +21,9 @@ use crate::perf::{FrameStats, format_bytes};
 use crate::projection::{MapProjection, MapView, Projection};
 use crate::renderer::{Globals, Renderer};
 use crate::scene::{MANTLE_FLOW_COLOR, PLATE_MOTION_COLOR, Scene};
+use crate::sim::GpuSim;
 use crate::tectonics::{BoundaryKind, Edge, edges};
+use crate::timestep::{RESOLVE_MYR, STEP_MYR, apply_columns, resolve_motion};
 use crate::view::{
     COLOR_AGE, COLOR_BUOYANCY, COLOR_COMPOSITION, COLOR_CRUST, COLOR_ELEVATION, COLOR_LITHOSPHERE,
     COLOR_MANTLE, COLOR_PLATES, COLOR_PROVINCE, COLOR_ROCK, LAYER_BOUNDARIES, LAYER_CRATONS,
@@ -90,6 +92,11 @@ const PERF_REFRESH_MS: f64 = 250.0;
 const COPIED_MS: i32 = 1500;
 /// On flat maps, the cursor column's width in CSS px (see `Scene::build`).
 const MAP_MARKER_PX: f64 = 3.0;
+/// Steps per animation frame at most, so a slow frame doesn't snowball.
+const MAX_STEPS_PER_FRAME: usize = 8;
+/// A frame gap longer than this (s) counts as this long, so a hidden tab
+/// doesn't come back owing hundreds of steps.
+const MAX_FRAME_S: f64 = 0.1;
 
 type FrameCallback = Rc<RefCell<Option<Closure<dyn FnMut(f64)>>>>;
 
@@ -153,6 +160,26 @@ struct App {
     legend: Element,
     hud_dirty: bool,
     perf: Perf,
+    sim: GpuSim,
+    time: Time,
+}
+
+/// Playback state and the Time controls.
+struct Time {
+    playing: bool,
+    /// Myr per second of playback.
+    speed: f64,
+    /// Steps owed to playback, carried between frames.
+    owed: f64,
+    /// Timestamp of the last animation frame (ms).
+    last_ms: Option<f64>,
+    /// Sim time of the last readback asked for.
+    read_myr: f64,
+    /// A motion re-solve due at this sim time (see `RESOLVE_MYR`): steps
+    /// wait until its readback is in and the plates have their new motion.
+    resolve_at: Option<f64>,
+    play: Element,
+    now: Element,
 }
 
 /// The column inspector card.
@@ -260,13 +287,106 @@ impl App {
         self.world = World::generate(&self.grid, &self.edges, seed);
         self.perf.generation_ms = now_ms() - start;
         self.renderer.set_world(&self.world);
+        // The renderer made a new cell buffer; the sim writes into it.
+        // Pause without reading back: the old run's results are moot.
+        self.time.playing = false;
+        self.set_playing(false);
+        self.sim = GpuSim::new(&self.renderer, &self.grid, &self.world);
+        self.time.read_myr = 0.0;
+        self.time.resolve_at = None;
+        self.show_time();
+        self.world_changed();
+        write_seed_to_url(seed);
+    }
+
+    /// Refresh everything drawn from `world` on the CPU side.
+    fn world_changed(&mut self) {
         self.update_overlays();
         self.update_legend();
         self.index_boundaries();
         self.inspector.shown = None;
         self.section.shown = None;
-        write_seed_to_url(seed);
         self.hud_dirty = true;
+    }
+
+    fn set_playing(&mut self, playing: bool) {
+        if self.time.playing && !playing {
+            // Pausing: bring the CPU side up to the paused moment.
+            self.request_readback();
+        }
+        self.time.playing = playing;
+        self.time.owed = 0.0;
+        set_text(&self.time.play, if playing { "Pause" } else { "Play" });
+    }
+
+    /// Advance one step by hand (pauses playback).
+    fn step_once(&mut self) {
+        self.set_playing(false);
+        if self.time.resolve_at.is_none() {
+            self.step_sim();
+            self.request_readback();
+        }
+    }
+
+    /// One step; at a re-solve time, asks for the readback it needs.
+    fn step_sim(&mut self) {
+        self.sim.step();
+        self.show_time();
+        if self.sim.time_myr % RESOLVE_MYR == 0.0 {
+            self.time.resolve_at = Some(self.sim.time_myr);
+            self.request_readback();
+        }
+    }
+
+    /// Asks for the world as it stands now, if it hasn't been asked for
+    /// and no other readback is in the way (`advance_time` retries).
+    fn request_readback(&mut self) {
+        if self.sim.time_myr != self.time.read_myr && !self.sim.reading_back() {
+            self.sim.request_readback();
+            self.time.read_myr = self.sim.time_myr;
+        }
+    }
+
+    fn show_time(&self) {
+        set_text(
+            &self.time.now,
+            &format!("{} Myr", group_thousands(self.sim.time_myr.round() as u64)),
+        );
+    }
+
+    /// Playback's share of an animation frame: readbacks collected (and
+    /// motion re-solved when one is due), then the steps owed.
+    fn advance_time(&mut self, time_ms: f64) {
+        let dt_s = self.time.last_ms.map_or(0.0, |last| {
+            ((time_ms - last) / 1000.0).clamp(0.0, MAX_FRAME_S)
+        });
+        self.time.last_ms = Some(time_ms);
+        if let Some((at, out)) = self.sim.take_readback() {
+            apply_columns(&mut self.world, &self.grid, &self.edges, &out);
+            if self.time.resolve_at == Some(at) {
+                resolve_motion(&mut self.world, &self.grid, &self.edges);
+                let omega: Vec<_> = self.world.plates.plates.iter().map(|p| p.omega).collect();
+                self.sim.set_omega(&omega);
+                self.time.resolve_at = None;
+            }
+            self.world_changed();
+        }
+        if self.time.resolve_at.is_some() {
+            // Still waiting on the re-solve's readback.
+            self.request_readback();
+            return;
+        }
+        if self.time.playing {
+            self.time.owed += self.time.speed * dt_s / STEP_MYR;
+            let steps = (self.time.owed.floor() as usize).min(MAX_STEPS_PER_FRAME);
+            self.time.owed = (self.time.owed - steps as f64).min(1.0);
+            for _ in 0..steps {
+                self.step_sim();
+                if self.time.resolve_at.is_some() {
+                    break;
+                }
+            }
+        }
     }
 
     fn set_color(&mut self, mode: u32) {
@@ -348,6 +468,7 @@ impl App {
     /// One animation frame; `time_ms` is the frame's timestamp.
     fn frame(&mut self, time_ms: f64) {
         let start = now_ms();
+        self.advance_time(time_ms);
         self.draw_frame();
         self.perf.stats.record(time_ms, now_ms() - start);
         if self.perf.visible && time_ms - self.perf.shown_at >= PERF_REFRESH_MS {
@@ -1071,6 +1192,7 @@ async fn run() -> Result<(), String> {
     let generation_ms = now_ms() - start;
 
     let renderer = Renderer::new(canvas.clone(), &grid, &world).await?;
+    let sim = GpuSim::new(&renderer, &grid, &world);
     let aspect = canvas.client_width().max(1) as f64 / canvas.client_height().max(1) as f64;
     let app = Rc::new(RefCell::new(App {
         canvas: canvas.clone(),
@@ -1137,6 +1259,17 @@ async fn run() -> Result<(), String> {
             generation_ms,
         },
         hud_dirty: true,
+        sim,
+        time: Time {
+            playing: false,
+            speed: 5.0,
+            owed: 0.0,
+            last_ms: None,
+            read_myr: 0.0,
+            resolve_at: None,
+            play: element("time-play")?,
+            now: element("time-now")?,
+        },
     }));
     app.borrow_mut().update_overlays();
     app.borrow_mut().index_boundaries();
@@ -1262,6 +1395,29 @@ async fn run() -> Result<(), String> {
     listen(&copy, "click", &app, |app, _: web_sys::Event| {
         app.copy_measurement()
     });
+    let play = element("time-play")?;
+    listen(&play, "click", &app, |app, _: web_sys::Event| {
+        app.set_playing(!app.time.playing)
+    });
+    let step = element("time-step")?;
+    listen(&step, "click", &app, |app, _: web_sys::Event| {
+        app.step_once()
+    });
+    let reset_time = element("time-reset")?;
+    listen(&reset_time, "click", &app, |app, _: web_sys::Event| {
+        app.set_seed(app.seed)
+    });
+    let speed: HtmlSelectElement = element("time-speed")?
+        .dyn_into()
+        .map_err(|_| "#time-speed is not a select")?;
+    let speed_of = |value: String| value.parse::<f64>().unwrap_or(5.0);
+    app.borrow_mut().time.speed = speed_of(speed.value());
+    listen(
+        &speed.clone(),
+        "change",
+        &app,
+        move |app, _: web_sys::Event| app.time.speed = speed_of(speed.value()),
+    );
     let new_world = element("new-world")?;
     listen(&new_world, "click", &app, |app, _: web_sys::Event| {
         app.set_seed(random_seed())

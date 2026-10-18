@@ -2,7 +2,9 @@
 //! Each is prefixed the same way the renderer builds them.
 
 const COMMON: &str = include_str!("../src/shaders/common.wgsl");
+const CUBE: &str = include_str!("../src/shaders/cube.wgsl");
 const SURFACE: &str = include_str!("../src/shaders/surface.wgsl");
+const LOOKUP: &str = include_str!("../src/shaders/lookup.wgsl");
 
 fn validate(name: &str, source: &str) {
     let module = naga::front::wgsl::parse_str(source)
@@ -18,19 +20,22 @@ fn validate(name: &str, source: &str) {
 #[test]
 fn globe() {
     let src = include_str!("../src/shaders/globe.wgsl");
-    validate("globe.wgsl", &format!("{COMMON}{SURFACE}{src}"));
+    validate(
+        "globe.wgsl",
+        &format!("{COMMON}{CUBE}{SURFACE}{LOOKUP}{src}"),
+    );
 }
 
 #[test]
 fn map() {
     let src = include_str!("../src/shaders/map.wgsl");
-    validate("map.wgsl", &format!("{COMMON}{SURFACE}{src}"));
+    validate("map.wgsl", &format!("{COMMON}{CUBE}{SURFACE}{LOOKUP}{src}"));
 }
 
 #[test]
 fn cells() {
     let src = include_str!("../src/shaders/cells.wgsl");
-    validate("cells.wgsl", &format!("{COMMON}{src}"));
+    validate("cells.wgsl", &format!("{COMMON}{CUBE}{src}"));
 }
 
 #[test]

@@ -176,6 +176,9 @@ pub struct Renderer {
     cell_map: wgpu::TextureView,
     surface_layout: wgpu::BindGroupLayout,
     surface_bind_group: wgpu::BindGroup,
+    /// The per-cell data the surface shaders read (CellData). The time step
+    /// writes it on the GPU.
+    cell_buffer: wgpu::Buffer,
     /// Bytes in the surface bind group's buffers.
     surface_bytes: u64,
     /// What the last frame drew.
@@ -323,7 +326,13 @@ impl Renderer {
             step_mode: wgpu::VertexStepMode::Vertex,
             attributes: &wgpu::vertex_attr_array![0 => Float32x3, 1 => Uint32],
         };
-        let globe_shader = shader!(device, "surface.wgsl", "globe.wgsl");
+        let globe_shader = shader!(
+            device,
+            "cube.wgsl",
+            "surface.wgsl",
+            "lookup.wgsl",
+            "globe.wgsl"
+        );
         let globe_pipeline = create_pipeline(
             &device,
             &globe_layout,
@@ -336,7 +345,13 @@ impl Renderer {
             None,
         );
 
-        let map_shader = shader!(device, "surface.wgsl", "map.wgsl");
+        let map_shader = shader!(
+            device,
+            "cube.wgsl",
+            "surface.wgsl",
+            "lookup.wgsl",
+            "map.wgsl"
+        );
         let map_pipeline = create_pipeline(
             &device,
             &globe_layout,
@@ -392,13 +407,14 @@ impl Renderer {
         let globe = GpuMesh::new(&device, "globe", &globe_vertices, &globe_indices);
         let cell_map = bake_cell_map(&device, &queue, &globe, cell_vertex_layout);
         let column = cylinder(COLUMN_SIDES);
-        let (surface_bind_group, surface_bytes) =
+        let (surface_bind_group, surface_bytes, cell_buffer) =
             create_surface_bind_group(&device, &surface_layout, world, &cell_map);
         Ok(Self {
             depth_view: create_depth_view(&device, width, height),
             globe,
             surface_bind_group,
             surface_bytes,
+            cell_buffer,
             counts: FrameCounts::default(),
             cell_map,
             map_pipeline,
@@ -422,6 +438,24 @@ impl Renderer {
             column_pipeline,
             line_pipeline,
         })
+    }
+
+    pub fn device(&self) -> &wgpu::Device {
+        &self.device
+    }
+
+    pub fn queue(&self) -> &wgpu::Queue {
+        &self.queue
+    }
+
+    /// The cell-id cube map, for point-to-cell lookups on the GPU.
+    pub fn cell_map(&self) -> &wgpu::TextureView {
+        &self.cell_map
+    }
+
+    /// The per-cell data buffer the surface shaders read.
+    pub fn cell_buffer(&self) -> &wgpu::Buffer {
+        &self.cell_buffer
     }
 
     /// Estimated GPU memory we have allocated: meshes, per-cell data, the
@@ -460,8 +494,11 @@ impl Renderer {
 
     /// Replace the per-cell surface data, e.g. after regenerating.
     pub fn set_world(&mut self, world: &World) {
-        (self.surface_bind_group, self.surface_bytes) =
-            create_surface_bind_group(&self.device, &self.surface_layout, world, &self.cell_map);
+        (
+            self.surface_bind_group,
+            self.surface_bytes,
+            self.cell_buffer,
+        ) = create_surface_bind_group(&self.device, &self.surface_layout, world, &self.cell_map);
     }
 
     /// Replace the lines of the overlay drawn for `layer` (one of
@@ -632,7 +669,7 @@ fn create_surface_bind_group(
     layout: &wgpu::BindGroupLayout,
     world: &World,
     cell_map: &wgpu::TextureView,
-) -> (wgpu::BindGroup, u64) {
+) -> (wgpu::BindGroup, u64, wgpu::Buffer) {
     let crust = &world.crust;
     let cells: Vec<CellData> = (0..crust.kind.len())
         .map(|c| CellData {
@@ -691,7 +728,7 @@ fn create_surface_bind_group(
             },
         ],
     });
-    (group, bytes)
+    (group, bytes, cell_data)
 }
 
 /// Renders the globe mesh from the planet's center into the six faces of a
@@ -717,7 +754,7 @@ fn bake_cell_map(
         usage: wgpu::TextureUsages::RENDER_ATTACHMENT | wgpu::TextureUsages::TEXTURE_BINDING,
         view_formats: &[],
     });
-    let shader = shader!(device, "cells.wgsl");
+    let shader = shader!(device, "cube.wgsl", "cells.wgsl");
     let layout = device.create_pipeline_layout(&wgpu::PipelineLayoutDescriptor {
         label: Some("cell map"),
         bind_group_layouts: &[],

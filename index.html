@@ -31,6 +31,9 @@
         border-radius: 6px; padding: 3px 10px; cursor: pointer;
       }
       .tray button:hover { background: #2c3347; }
+      .tray .time { display: flex; align-items: center; gap: 6px; margin-bottom: 4px; }
+      .tray .time select { width: auto; margin: 0 0 0 auto; }
+      #time-now { font-variant-numeric: tabular-nums; color: #bbb; }
       /* Cross-section panel, filled in by cross_section.rs. It sits between
          the left panel and the right-hand cards. */
       #section {
@@ -211,6 +214,23 @@
         <label><input type="checkbox" id="inspect-section" /> Cross-section along measurement</label>
         <h2>Diagnostics</h2>
         <label><input type="checkbox" id="perf-stats" /> Performance stats</label>
+        <h2>Time</h2>
+        <div class="time">
+          <button type="button" id="time-play">Play</button>
+          <button type="button" id="time-step" title="Advance 1 million years">+1 Myr</button>
+          <button type="button" id="time-reset" title="Back to the start of this world">Reset</button>
+        </div>
+        <div class="time">
+          <span id="time-now">0 Myr</span>
+          <!-- Values are Myr per second of playback. -->
+          <select id="time-speed" aria-label="Playback speed">
+            <option value="1">1 Myr/s</option>
+            <option value="2">2 Myr/s</option>
+            <option value="5" selected>5 Myr/s</option>
+            <option value="10">10 Myr/s</option>
+            <option value="20">20 Myr/s</option>
+          </select>
+        </div>
         <h2>World</h2>
         <div class="world">
           <span id="world-seed"></span>

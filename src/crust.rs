@@ -53,6 +53,26 @@ const RIDGE_DEPTH_M: f64 = 2500.0;
 const SEA_LEVEL_BUOYANCY: f64 = (RHO_ASTHENOSPHERE - RHO_MAFIC_CRUST) * OCEANIC_THICKNESS_KM
     + RIDGE_DEPTH_M / 1000.0 * (RHO_ASTHENOSPHERE - RHO_WATER);
 
+/// The physics constants above as WGSL declarations, so the GPU time step
+/// computes columns and isostasy with exactly these values.
+pub fn wgsl_constants() -> String {
+    [
+        ("OCEANIC_THICKNESS_KM", OCEANIC_THICKNESS_KM),
+        ("RHO_ASTHENOSPHERE", RHO_ASTHENOSPHERE),
+        ("RHO_WATER", RHO_WATER),
+        ("RHO_SEDIMENT", RHO_SEDIMENT),
+        ("RHO_MAFIC_CRUST", RHO_MAFIC_CRUST),
+        ("RHO_FELSIC_CRUST", RHO_FELSIC_CRUST),
+        ("THERMAL_EXCESS", THERMAL_EXCESS),
+        ("DEPLETION_DEFICIT", DEPLETION_DEFICIT),
+        ("RIDGE_DEPTH_M", RIDGE_DEPTH_M),
+        ("SEA_LEVEL_BUOYANCY", SEA_LEVEL_BUOYANCY),
+    ]
+    .iter()
+    .map(|(name, v)| format!("const {name}: f32 = {v:?};\n"))
+    .collect()
+}
+
 /// Crust density (kg/m³) for a felsic fraction from 0 (mafic) to 1.
 pub fn crust_density(felsic: f64) -> f64 {
     RHO_MAFIC_CRUST + (RHO_FELSIC_CRUST - RHO_MAFIC_CRUST) * felsic.clamp(0.0, 1.0)
