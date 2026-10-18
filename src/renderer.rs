@@ -7,7 +7,8 @@ use crate::palette;
 use crate::projection::Projection;
 use crate::scene::{Column, Scene, Segment};
 use crate::view::{
-    LAYER_BOUNDARIES, LAYER_HOTSPOTS, LAYER_MANTLE, LAYER_MOTION, LAYER_PROVINCES, LAYER_TRACKS,
+    LAYER_BOUNDARIES, LAYER_CRATONS, LAYER_FORCES, LAYER_HOTSPOTS, LAYER_MANTLE, LAYER_MOTION,
+    LAYER_PROVINCES, LAYER_TRACKS,
 };
 use crate::world::World;
 
@@ -18,8 +19,10 @@ const CELL_MAP_SIZE: u32 = 1024;
 const CELL_MAP_FORMAT: wgpu::TextureFormat = wgpu::TextureFormat::R32Uint;
 
 /// Line overlays, each drawn when its layer bit is set.
-pub const OVERLAYS: [u32; 6] = [
+pub const OVERLAYS: [u32; 8] = [
     LAYER_BOUNDARIES,
+    LAYER_CRATONS,
+    LAYER_FORCES,
     LAYER_MOTION,
     LAYER_MANTLE,
     LAYER_PROVINCES,
@@ -37,6 +40,11 @@ struct CellData {
     age_myr: f32,
     thickness_km: f32,
     dynamic_m: f32,
+    felsic: f32,
+    lithosphere_km: f32,
+    density_excess: f32,
+    rock: u32,
+    province: u32,
 }
 
 #[repr(C)]
@@ -635,8 +643,13 @@ fn create_surface_bind_group(
             } else {
                 crust.age_myr[c] as f32
             },
-            thickness_km: crust.thickness_km[c] as f32,
+            thickness_km: crust.column[c].crust_km as f32,
             dynamic_m: world.dynamic_m[c] as f32,
+            felsic: crust.column[c].felsic as f32,
+            lithosphere_km: crust.column[c].thickness_km() as f32,
+            density_excess: crust.column[c].density_excess() as f32,
+            rock: crust.rock[c] as u32,
+            province: crust.province[c] as u32,
         })
         .collect();
     let colors: Vec<[f32; 4]> = world

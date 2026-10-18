@@ -1,13 +1,17 @@
 use std::cell::RefCell;
+use std::collections::HashMap;
 use std::rc::Rc;
 
 use wasm_bindgen::JsCast;
 use wasm_bindgen::prelude::*;
 use web_sys::{
-    Element, HtmlCanvasElement, HtmlInputElement, KeyboardEvent, PointerEvent, WheelEvent,
+    Element, HtmlCanvasElement, HtmlInputElement, HtmlSelectElement, KeyboardEvent, PointerEvent,
+    WheelEvent,
 };
 
 use crate::camera::{OrbitCamera, ray_sphere};
+use crate::column_view;
+use crate::cross_section;
 use crate::geo::{EARTH_RADIUS_M, LonLat, group_thousands};
 use crate::grid::{Grid, h3_centers};
 use crate::legend::{self, PlateKey};
@@ -17,10 +21,12 @@ use crate::perf::{FrameStats, format_bytes};
 use crate::projection::{MapProjection, MapView, Projection};
 use crate::renderer::{Globals, Renderer};
 use crate::scene::{MANTLE_FLOW_COLOR, PLATE_MOTION_COLOR, Scene};
-use crate::tectonics::{Edge, edges};
+use crate::tectonics::{BoundaryKind, Edge, edges};
 use crate::view::{
-    COLOR_AGE, COLOR_CRUST, COLOR_ELEVATION, COLOR_MANTLE, COLOR_PLATES, LAYER_BOUNDARIES,
-    LAYER_GRATICULE, LAYER_HOTSPOTS, LAYER_MANTLE, LAYER_MOTION, LAYER_PROVINCES, LAYER_TRACKS,
+    COLOR_AGE, COLOR_BUOYANCY, COLOR_COMPOSITION, COLOR_CRUST, COLOR_ELEVATION, COLOR_LITHOSPHERE,
+    COLOR_MANTLE, COLOR_PLATES, COLOR_PROVINCE, COLOR_ROCK, LAYER_BOUNDARIES, LAYER_CRATONS,
+    LAYER_FORCES, LAYER_GRATICULE, LAYER_HOTSPOTS, LAYER_MANTLE, LAYER_MOTION, LAYER_PROVINCES,
+    LAYER_TRACKS,
 };
 use crate::world::World;
 use glam::DVec3;
@@ -37,8 +43,10 @@ const PLATE_RESOLUTION: Resolution = Resolution::Three;
 /// Arrows sit at the centers of this coarser H3 grid (842 cells).
 const ARROW_RESOLUTION: Resolution = Resolution::One;
 /// Layer tray checkboxes and the layer bit each controls.
-const LAYER_TOGGLES: [(&str, u32); 7] = [
+const LAYER_TOGGLES: [(&str, u32); 9] = [
     ("layer-boundaries", LAYER_BOUNDARIES),
+    ("layer-forces", LAYER_FORCES),
+    ("layer-cratons", LAYER_CRATONS),
     ("layer-motion", LAYER_MOTION),
     ("layer-graticule", LAYER_GRATICULE),
     ("layer-mantle", LAYER_MANTLE),
@@ -46,14 +54,22 @@ const LAYER_TOGGLES: [(&str, u32); 7] = [
     ("layer-hotspots", LAYER_HOTSPOTS),
     ("layer-tracks", LAYER_TRACKS),
 ];
-/// "Color by" tray radio buttons.
-const COLOR_CHOICES: [(&str, u32); 5] = [
-    ("color-elevation", COLOR_ELEVATION),
-    ("color-plates", COLOR_PLATES),
-    ("color-age", COLOR_AGE),
-    ("color-crust", COLOR_CRUST),
-    ("color-mantle", COLOR_MANTLE),
+/// "Color by" dropdown options, by their `value` in index.html.
+const COLOR_CHOICES: [(&str, u32); 10] = [
+    ("elevation", COLOR_ELEVATION),
+    ("rock", COLOR_ROCK),
+    ("age", COLOR_AGE),
+    ("plates", COLOR_PLATES),
+    ("crust", COLOR_CRUST),
+    ("composition", COLOR_COMPOSITION),
+    ("province", COLOR_PROVINCE),
+    ("lithosphere", COLOR_LITHOSPHERE),
+    ("buoyancy", COLOR_BUOYANCY),
+    ("mantle", COLOR_MANTLE),
 ];
+/// A cross-section drag shorter than this (CSS px) along an axis doesn't
+/// zoom that axis.
+const SECTION_DRAG_MIN_PX: f64 = 6.0;
 /// Dynamic topography below this (m) reads as "little vertical flow".
 const MANTLE_STILL_M: f64 = 50.0;
 /// Within this distance (m) of a deep province's outline, the HUD calls it
@@ -127,10 +143,52 @@ struct App {
     hud_cell: Element,
     hud_crust: Element,
     hud_deep: Element,
+    hud_rock: Element,
+    hud_boundary: Element,
+    /// For each cell on a plate boundary, one boundary touching it.
+    cell_boundary: HashMap<u32, usize>,
+    inspector: Inspector,
+    section: Section,
     world_seed: Element,
     legend: Element,
     hud_dirty: bool,
     perf: Perf,
+}
+
+/// The column inspector card.
+struct Inspector {
+    card: Element,
+    body: Element,
+    visible: bool,
+    /// The cell last drawn, to redraw only when the cursor changes cell.
+    shown: Option<u32>,
+}
+
+/// The cross-section panel.
+struct Section {
+    card: Element,
+    title: Element,
+    body: Element,
+    /// The box drawn while dragging to zoom, and the reset button.
+    brush: Element,
+    reset: Element,
+    visible: bool,
+    /// The span last drawn, to redraw only when the measurement or zoom
+    /// changes.
+    shown: Option<(LonLat, LonLat)>,
+    dirty: bool,
+    zoom: cross_section::Zoom,
+    /// How the last drawing maps to SVG coordinates.
+    frame: Option<cross_section::Frame>,
+    /// A drag in progress: the panel and where it started (SVG units).
+    drag: Option<(cross_section::Panel, (f64, f64))>,
+    /// The samples last drawn, for the hover readout.
+    samples: Vec<cross_section::Sample>,
+    /// The hover guide line and its readout.
+    guide: Element,
+    readout: Element,
+    /// Where the cursor is along the line (km), while over the chart.
+    probe_km: Option<f64>,
 }
 
 /// The performance panel and the numbers behind it.
@@ -204,6 +262,9 @@ impl App {
         self.renderer.set_world(&self.world);
         self.update_overlays();
         self.update_legend();
+        self.index_boundaries();
+        self.inspector.shown = None;
+        self.section.shown = None;
         write_seed_to_url(seed);
         self.hud_dirty = true;
     }
@@ -253,6 +314,14 @@ impl App {
             MANTLE_FLOW_COLOR,
         );
         self.renderer.set_overlay(LAYER_BOUNDARIES, &boundaries);
+        self.renderer.set_overlay(
+            LAYER_FORCES,
+            &Scene::force_arrows(&w.forces, &self.edges, &w.plates.cell_plate, r),
+        );
+        self.renderer.set_overlay(
+            LAYER_CRATONS,
+            &Scene::craton_outlines(&self.edges, &w.crust.province, r),
+        );
         self.renderer.set_overlay(LAYER_MOTION, &motion);
         self.renderer.set_overlay(LAYER_MANTLE, &mantle);
         self.renderer.set_overlay(
@@ -374,7 +443,18 @@ impl App {
         if !self.measure.is_finished() && hover.is_some() {
             self.measure_end = hover;
         }
-        let scene = Scene::build(&self.measure, hover, self.camera.radius, marker_scale);
+        let probe = self
+            .section
+            .probe_km
+            .zip(self.measure.span(self.measure_end))
+            .map(|(km, line)| cross_section::point_at(line, km, self.camera.radius / 1000.0));
+        let scene = Scene::build(
+            &self.measure,
+            hover,
+            probe,
+            self.camera.radius,
+            marker_scale,
+        );
         self.renderer.render(&globals, &scene);
         self.update_hud(hover);
     }
@@ -403,8 +483,9 @@ impl App {
             let elevation = format_meters(crust.elevation_m[c]);
             let crust = if crust.kind[c].is_continental() {
                 format!(
-                    "Continent, {:.0} km crust, {elevation}",
-                    crust.thickness_km[c]
+                    "Continent ({}), {:.0} km crust, {elevation}",
+                    crust.province[c].name(),
+                    crust.column[c].crust_km
                 )
             } else {
                 format!("Ocean floor, {:.0} Myr old, {elevation}", crust.age_myr[c])
@@ -415,12 +496,310 @@ impl App {
         set_text(&self.hud_crust, &crust);
         let deep = hover.map_or_else(String::new, |h| self.deep_earth_text(h));
         set_text(&self.hud_deep, &deep);
+        let cell = hover.map(|h| self.grid.cell_at(h));
+        let rock = cell.map_or_else(String::new, |c| self.rock_text(c as usize));
+        set_text(&self.hud_rock, &rock);
+        let boundary = cell.map_or_else(String::new, |c| self.boundary_text(c));
+        set_text(&self.hud_boundary, &boundary);
+        self.update_inspector(cell);
+        self.update_section();
         self.update_measure_box();
         if !self.hud_dirty {
             return;
         }
         self.hud_dirty = false;
         set_text(&self.world_seed, &format!("Seed {}", self.seed));
+    }
+
+    /// Maps boundary cells to a boundary touching them, for the HUD.
+    fn index_boundaries(&mut self) {
+        self.cell_boundary.clear();
+        for (i, b) in self.world.boundaries.iter().enumerate() {
+            let e = &self.edges[b.edge as usize];
+            self.cell_boundary.entry(e.a).or_insert(i);
+            self.cell_boundary.entry(e.b).or_insert(i);
+        }
+    }
+
+    /// HUD line about the plate boundary at cell `c`, if it is on one.
+    fn boundary_text(&self, c: u32) -> String {
+        let Some(&i) = self.cell_boundary.get(&c) else {
+            return String::new();
+        };
+        let b = &self.world.boundaries[i];
+        let e = &self.edges[b.edge as usize];
+        let plate = |cell: u32| self.world.plates.cell_plate[cell as usize] + 1;
+        let (pa, pb) = (plate(e.a), plate(e.b));
+        let rate = b.rate;
+        match b.kind {
+            BoundaryKind::Subduction => {
+                let over = b.overriding(&self.edges);
+                let columns = &self.world.crust.column;
+                let denser = columns[b.subducting as usize].density_excess()
+                    - columns[over as usize].density_excess();
+                format!(
+                    "Subduction: plate {} sinks under plate {} at {rate:.1} cm/yr \
+                     (its column {denser:.0} kg/m³ denser)",
+                    plate(b.subducting),
+                    plate(over)
+                )
+            }
+            BoundaryKind::Collision => {
+                format!("Collision: plates {pa} and {pb} converge at {rate:.1} cm/yr")
+            }
+            BoundaryKind::Ridge => {
+                format!("Spreading ridge: plates {pa} and {pb} part at {rate:.1} cm/yr")
+            }
+            BoundaryKind::Rift => {
+                format!("Continental rift: plates {pa} and {pb} part at {rate:.1} cm/yr")
+            }
+            BoundaryKind::Transform => {
+                format!("Transform fault: plates {pa} and {pb} slide past at {rate:.1} cm/yr")
+            }
+        }
+    }
+
+    /// HUD line about the surface rock and column of cell `c`.
+    fn rock_text(&self, c: usize) -> String {
+        let crust = &self.world.crust;
+        let col = &crust.column[c];
+        format!(
+            "{} · crust {:.2} g/cm³, {:.0}% felsic · lithosphere {:.0} km",
+            crust.rock[c].name(),
+            crate::crust::crust_density(col.felsic) / 1000.0,
+            100.0 * col.felsic,
+            col.thickness_km()
+        )
+    }
+
+    fn set_inspector_visible(&mut self, visible: bool) {
+        self.inspector.visible = visible;
+        self.inspector.shown = None;
+        if visible {
+            let _ = self.inspector.card.remove_attribute("hidden");
+        } else {
+            let _ = self.inspector.card.set_attribute("hidden", "");
+        }
+    }
+
+    /// Redraws the column inspector if it is open and the cell changed.
+    fn update_inspector(&mut self, cell: Option<u32>) {
+        if !self.inspector.visible || cell == self.inspector.shown {
+            return;
+        }
+        self.inspector.shown = cell;
+        let html = cell.map_or_else(
+            || "<p class=\"help\">Point at the planet to inspect its column.</p>".into(),
+            |c| column_view::svg(&self.world.crust.column[c as usize]),
+        );
+        self.inspector.body.set_inner_html(&html);
+    }
+
+    fn set_section_visible(&mut self, visible: bool) {
+        self.section.visible = visible;
+        self.section.shown = None;
+        if visible {
+            let _ = self.section.card.remove_attribute("hidden");
+            self.update_section();
+        } else {
+            let _ = self.section.card.set_attribute("hidden", "");
+            self.section_leave();
+        }
+    }
+
+    /// Redraws the cross-section if it is open and the measurement changed
+    /// (it follows the cursor while measuring).
+    fn update_section(&mut self) {
+        if !self.section.visible {
+            return;
+        }
+        let span = self.measure.span(self.measure_end);
+        if span != self.section.shown {
+            // A new line starts unzoomed.
+            self.section.zoom = cross_section::Zoom::default();
+        } else if span.is_some() && !self.section.dirty {
+            return;
+        }
+        self.section.shown = span;
+        self.section.dirty = false;
+        if self.section.zoom.is_zoomed() {
+            let _ = self.section.reset.remove_attribute("hidden");
+        } else {
+            let _ = self.section.reset.set_attribute("hidden", "");
+        }
+        match span {
+            Some(line) => {
+                let radius_km = self.camera.radius / 1000.0;
+                let zoom = self.section.zoom;
+                let (samples, _) = cross_section::sample(
+                    &self.world,
+                    &self.grid,
+                    &self.edges,
+                    line,
+                    radius_km,
+                    zoom.km,
+                );
+                // Markers come from the whole line: a slab dips far from its
+                // trench, so it can cross a zoomed view whose stretch doesn't
+                // include the trench itself. The header describes the whole
+                // line too.
+                let (whole, markers) = cross_section::sample(
+                    &self.world,
+                    &self.grid,
+                    &self.edges,
+                    line,
+                    radius_km,
+                    None,
+                );
+                set_text(
+                    &self.section.title,
+                    &format!("Cross-section · {}", cross_section::describe(&whole)),
+                );
+                let (svg, frame) = cross_section::svg(&samples, &markers, &zoom);
+                self.section.body.set_inner_html(&svg);
+                self.section.frame = Some(frame);
+                self.section.samples = samples;
+            }
+            None => {
+                self.section.frame = None;
+                set_text(&self.section.title, "Cross-section");
+                self.section.body.set_inner_html(
+                    "<p class=\"help\">Click two points on the planet to measure a \
+                     line; its cross-section appears here.</p>",
+                );
+            }
+        }
+    }
+
+    /// A pointer position as SVG coordinates of the cross-section chart,
+    /// and the scale from SVG units to CSS pixels.
+    fn section_point(&self, e: &web_sys::MouseEvent) -> ((f64, f64), f64) {
+        let rect = self.section.body.get_bounding_client_rect();
+        let scale = cross_section::Frame::WIDTH / rect.width().max(1.0);
+        (
+            (
+                (e.client_x() as f64 - rect.left()) * scale,
+                (e.client_y() as f64 - rect.top()) * scale,
+            ),
+            scale,
+        )
+    }
+
+    fn section_down(&mut self, e: &PointerEvent) {
+        let Some(frame) = self.section.frame else {
+            return;
+        };
+        let (p, _) = self.section_point(e);
+        if e.button() == 0
+            && let Some(panel) = frame.panel_at(p.0, p.1)
+        {
+            self.section.drag = Some((panel, p));
+            let _ = self.section.body.set_pointer_capture(e.pointer_id());
+        }
+    }
+
+    /// Draws the zoom box from the drag's start to the pointer, kept within
+    /// the panel the drag started in.
+    fn section_move(&mut self, e: &PointerEvent) {
+        let Some((panel, from)) = self.section.drag else {
+            self.section_hover(e);
+            return;
+        };
+        let (to, scale) = self.section_point(e);
+        let (x0, x1) = cross_section::Frame::plot_x();
+        let (y0, y1) = cross_section::Frame::panel_y(panel);
+        let to = (to.0.clamp(x0, x1), to.1.clamp(y0, y1));
+        let (left, top) = (from.0.min(to.0) / scale, from.1.min(to.1) / scale);
+        let (w, h) = ((to.0 - from.0).abs() / scale, (to.1 - from.1).abs() / scale);
+        let _ = self.section.brush.set_attribute(
+            "style",
+            &format!("left:{left:.1}px;top:{top:.1}px;width:{w:.1}px;height:{h:.1}px"),
+        );
+        let _ = self.section.brush.remove_attribute("hidden");
+    }
+
+    fn section_up(&mut self, e: &PointerEvent) {
+        let Some((panel, from)) = self.section.drag.take() else {
+            return;
+        };
+        let _ = self.section.brush.set_attribute("hidden", "");
+        let Some(frame) = self.section.frame else {
+            return;
+        };
+        let (to, scale) = self.section_point(e);
+        let zoom = frame.zoom_to(
+            self.section.zoom,
+            panel,
+            from,
+            to,
+            SECTION_DRAG_MIN_PX * scale,
+        );
+        if zoom != self.section.zoom {
+            self.section.zoom = zoom;
+            self.section.dirty = true;
+            self.update_section();
+        }
+    }
+
+    /// Follows the cursor over the chart: a guide line, a readout, and the
+    /// matching point marked on the globe.
+    fn section_hover(&mut self, e: &PointerEvent) {
+        let (Some(frame), Some(line)) = (self.section.frame, self.measure.span(self.measure_end))
+        else {
+            return self.section_leave();
+        };
+        let (p, scale) = self.section_point(e);
+        let (x0, x1) = cross_section::Frame::plot_x();
+        if !(x0..=x1).contains(&p.0) {
+            return self.section_leave();
+        }
+        let km = frame.km_at(p.0);
+        self.section.probe_km = Some(km);
+        let _ = self
+            .section
+            .guide
+            .set_attribute("style", &format!("left:{:.1}px", p.0 / scale));
+        let _ = self.section.guide.remove_attribute("hidden");
+
+        let radius_km = self.camera.radius / 1000.0;
+        let total = line.0.to_unit().angle_between(line.1.to_unit()) * radius_km;
+        let at = cross_section::point_at(line, km, radius_km);
+        let mut text = format!(
+            "{} of {} km · {}",
+            format_km(km),
+            format_km(total),
+            at.display()
+        );
+        if let Some(s) = cross_section::nearest_sample(&self.section.samples, km) {
+            text += &format!(" · {}", format_meters(s.elevation_m));
+            if frame.panel_at(p.0, p.1) == Some(cross_section::Panel::Section) {
+                let depth = frame.value_at(cross_section::Panel::Section, p.1);
+                let place = if depth < 0.0 {
+                    format!("{} km above sea level", format_km(-depth))
+                } else {
+                    format!("{} km below sea level", format_km(depth))
+                };
+                text += &format!(" · {place}: {}", cross_section::layer_at(s, depth));
+            }
+        }
+        set_text(&self.section.readout, &text);
+    }
+
+    fn section_leave(&mut self) {
+        self.section.probe_km = None;
+        let _ = self.section.guide.set_attribute("hidden", "");
+        set_text(
+            &self.section.readout,
+            "Hover the chart to find the point on the globe.",
+        );
+    }
+
+    fn reset_section_zoom(&mut self) {
+        if self.section.zoom.is_zoomed() {
+            self.section.zoom = cross_section::Zoom::default();
+            self.section.dirty = true;
+            self.update_section();
+        }
     }
 
     /// HUD line about the mantle and any hotspot volcano under `h`.
@@ -447,11 +826,10 @@ impl App {
             text += " (over a deep province)";
         }
         if let Some(mark) = self.world.hotspot_marks[c] {
-            let plume = if self.world.hotspots[mark.hotspot as usize].is_strong() {
-                "strong plume"
-            } else {
-                "weak plume"
-            };
+            let plume = format!(
+                "{} plume",
+                self.world.hotspots[mark.hotspot as usize].kind.name()
+            );
             if mark.age_myr < 1.0 {
                 text += &format!(" · Active hotspot volcano ({plume})");
             } else {
@@ -620,6 +998,12 @@ fn write_seed_to_url(seed: u64) {
     }
 }
 
+/// Kilometers to one decimal with thousands separators, e.g. `1,234.5`.
+fn format_km(km: f64) -> String {
+    let tenths = (km.abs() * 10.0).round() as u64;
+    format!("{}.{}", group_thousands(tenths / 10), tenths % 10)
+}
+
 /// Signed elevation like `+1,234 m` or `−4,812 m`.
 fn format_meters(m: f64) -> String {
     let sign = if m < 0.0 { '\u{2212}' } else { '+' };
@@ -716,6 +1100,32 @@ async fn run() -> Result<(), String> {
         hud_cell: element("hud-cell")?,
         hud_crust: element("hud-crust")?,
         hud_deep: element("hud-deep")?,
+        hud_rock: element("hud-rock")?,
+        hud_boundary: element("hud-boundary")?,
+        cell_boundary: HashMap::new(),
+        section: Section {
+            card: element("section")?,
+            title: element("section-title")?,
+            body: element("section-body")?,
+            brush: element("section-brush")?,
+            reset: element("section-reset")?,
+            visible: false,
+            shown: None,
+            dirty: false,
+            zoom: cross_section::Zoom::default(),
+            frame: None,
+            drag: None,
+            samples: Vec::new(),
+            guide: element("section-guide")?,
+            readout: element("section-readout")?,
+            probe_km: None,
+        },
+        inspector: Inspector {
+            card: element("inspector")?,
+            body: element("inspector-body")?,
+            visible: false,
+            shown: None,
+        },
         world_seed: element("world-seed")?,
         legend: element("legend")?,
         perf: Perf {
@@ -729,6 +1139,7 @@ async fn run() -> Result<(), String> {
         hud_dirty: true,
     }));
     app.borrow_mut().update_overlays();
+    app.borrow_mut().index_boundaries();
     log::info!("renderer ready");
 
     listen(&canvas, "pointerdown", &app, |app, e: PointerEvent| {
@@ -761,24 +1172,64 @@ async fn run() -> Result<(), String> {
             move |app, _: web_sys::Event| app.set_layer(bit, input.checked()),
         );
     }
-    for (id, mode) in COLOR_CHOICES {
-        let input: HtmlInputElement = element(id)?
-            .dyn_into()
-            .map_err(|_| format!("#{id} is not an input"))?;
-        if input.checked() {
-            app.borrow_mut().set_color(mode);
-        }
-        listen(
-            &input.clone(),
-            "change",
-            &app,
-            move |app, _: web_sys::Event| {
-                if input.checked() {
-                    app.set_color(mode);
-                }
-            },
-        );
-    }
+    let color_select: HtmlSelectElement = element("color-mode")?
+        .dyn_into()
+        .map_err(|_| "#color-mode is not a select")?;
+    let mode_of = |value: String| {
+        COLOR_CHOICES
+            .iter()
+            .find(|(v, _)| *v == value)
+            .map_or(COLOR_ELEVATION, |&(_, mode)| mode)
+    };
+    app.borrow_mut().set_color(mode_of(color_select.value()));
+    listen(
+        &color_select.clone(),
+        "change",
+        &app,
+        move |app, _: web_sys::Event| app.set_color(mode_of(color_select.value())),
+    );
+    let chart = element("section-body")?;
+    listen(&chart, "pointerdown", &app, |app, e: PointerEvent| {
+        app.section_down(&e)
+    });
+    listen(&chart, "pointermove", &app, |app, e: PointerEvent| {
+        app.section_move(&e)
+    });
+    listen(&chart, "pointerup", &app, |app, e: PointerEvent| {
+        app.section_up(&e)
+    });
+    listen(&chart, "pointerleave", &app, |app, _: PointerEvent| {
+        app.section_leave()
+    });
+    listen(&chart, "dblclick", &app, |app, _: web_sys::MouseEvent| {
+        app.reset_section_zoom()
+    });
+    let reset = element("section-reset")?;
+    listen(&reset, "click", &app, |app, _: web_sys::Event| {
+        app.reset_section_zoom()
+    });
+    let section_toggle: HtmlInputElement = element("inspect-section")?
+        .dyn_into()
+        .map_err(|_| "#inspect-section is not an input")?;
+    app.borrow_mut()
+        .set_section_visible(section_toggle.checked());
+    listen(
+        &section_toggle.clone(),
+        "change",
+        &app,
+        move |app, _: web_sys::Event| app.set_section_visible(section_toggle.checked()),
+    );
+    let inspector_toggle: HtmlInputElement = element("inspect-column")?
+        .dyn_into()
+        .map_err(|_| "#inspect-column is not an input")?;
+    app.borrow_mut()
+        .set_inspector_visible(inspector_toggle.checked());
+    listen(
+        &inspector_toggle.clone(),
+        "change",
+        &app,
+        move |app, _: web_sys::Event| app.set_inspector_visible(inspector_toggle.checked()),
+    );
     for (id, kind) in PROJECTION_CHOICES {
         let input: HtmlInputElement = element(id)?
             .dyn_into()

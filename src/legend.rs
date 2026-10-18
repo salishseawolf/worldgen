@@ -3,16 +3,21 @@
 
 use std::fmt::Write;
 
+use crate::crust::{CrustProvince, SurfaceRock};
 use crate::palette::{self, Stop};
 use crate::scene::{
-    ARROW_DEG_PER_CM_YEAR, HOTSPOT_COLOR, MANTLE_FLOW_COLOR, PLATE_MOTION_COLOR, PROVINCE_COLOR,
-    TRACK_TICK_MYR, boundary_color,
+    ARROW_DEG_PER_CM_YEAR, CRATON_COLOR, FORCE_ARROW_DEG_PER_1000_KM, MANTLE_FLOW_COLOR,
+    PLATE_MOTION_COLOR, PROVINCE_COLOR, RIDGE_PUSH_COLOR, SLAB_PULL_COLOR, TRACK_TICK_MYR,
+    boundary_color, hotspot_color,
 };
 use crate::tectonics::BoundaryKind;
 use crate::view::{
-    COLOR_AGE, COLOR_CRUST, COLOR_ELEVATION, COLOR_MANTLE, COLOR_PLATES, LAYER_BOUNDARIES,
-    LAYER_GRATICULE, LAYER_HOTSPOTS, LAYER_MANTLE, LAYER_MOTION, LAYER_PROVINCES, LAYER_TRACKS,
+    COLOR_AGE, COLOR_BUOYANCY, COLOR_COMPOSITION, COLOR_CRUST, COLOR_ELEVATION, COLOR_LITHOSPHERE,
+    COLOR_MANTLE, COLOR_PLATES, COLOR_PROVINCE, COLOR_ROCK, LAYER_BOUNDARIES, LAYER_CRATONS,
+    LAYER_FORCES, LAYER_GRATICULE, LAYER_HOTSPOTS, LAYER_MANTLE, LAYER_MOTION, LAYER_PROVINCES,
+    LAYER_TRACKS,
 };
+use crate::world::PlumeKind;
 
 /// What the key shows for one plate.
 pub struct PlateKey {
@@ -77,6 +82,77 @@ pub fn html(color_mode: u32, layers: u32, plates: &[PlateKey]) -> String {
                     rising mantle) or drags it down (blue, over sinking mantle and \
                     slabs under trenches).</p>";
         }
+        COLOR_ROCK => {
+            out += "<h2>Surface rock</h2>";
+            for (rock, color) in SurfaceRock::ALL.iter().zip(palette::ROCK) {
+                out += &swatch(
+                    &palette::css(color),
+                    &format!("{}: {}", rock.name(), rock.origin()),
+                );
+            }
+        }
+        COLOR_PROVINCE => {
+            out += "<h2>Crustal age province</h2>";
+            for (p, color) in CrustProvince::ALL.iter().zip(palette::PROVINCE) {
+                let note = match p.column() {
+                    Some(c) => format!(
+                        "{}: lithosphere {:.0} km, crust {:.0} km",
+                        p.name(),
+                        c.thickness_km(),
+                        c.crust_km
+                    ),
+                    None => format!("{}: thin, young lithosphere", p.name()),
+                };
+                out += &swatch(&palette::css(color), &note);
+            }
+            out += "<p>Continents grew outward from ancient cores; crust at \
+                    active boundaries is reworked into young lithosphere.</p>";
+        }
+        COLOR_COMPOSITION => {
+            out += "<h2>Crust composition</h2>";
+            out += &ramp(
+                palette::COMPOSITION,
+                0.0,
+                1.0,
+                &[0.0, 0.5, 1.0],
+                false,
+                |v| match v {
+                    v if v < 0.25 => "basaltic".into(),
+                    v if v < 0.75 => "andesitic".into(),
+                    _ => "granitic".into(),
+                },
+            );
+            out += "<p>Felsic fraction, from mafic (about 50% silica, 2.90 g/cm³) \
+                    to felsic (about 70%, 2.70 g/cm³). Ocean crust is basaltic; \
+                    continents average andesitic.</p>";
+        }
+        COLOR_LITHOSPHERE => {
+            out += "<h2>Lithosphere thickness</h2>";
+            out += &ramp(
+                palette::LITHOSPHERE,
+                0.0,
+                250.0,
+                &[0.0, 100.0, 250.0],
+                true,
+                |v| format!("{v:.0} km"),
+            );
+            out += "<p>Crust plus cold mantle lithosphere. Thin at ridges, \
+                    thickening as seafloor ages; deepest under continents.</p>";
+        }
+        COLOR_BUOYANCY => {
+            out += "<h2>Buoyancy</h2>";
+            out += &ramp(
+                palette::BUOYANCY,
+                -500.0,
+                100.0,
+                &[-500.0, -200.0, 0.0, 100.0],
+                true,
+                |v| format!("{} kg/m³", signed(v)),
+            );
+            out += "<p>Column density minus the mantle below it. Purple floats; \
+                    orange is heavy enough to sink, as seafloor becomes after \
+                    about 12 Myr.</p>";
+        }
         COLOR_PLATES => {
             out += "<h2>Plates</h2><p>Plate number and mean speed (cm/yr).</p>";
             out += "<div class=\"plates\">";
@@ -106,6 +182,23 @@ pub fn html(color_mode: u32, layers: u32, plates: &[PlateKey]) -> String {
             out += &line(&rgba_css(boundary_color(kind)), label);
         }
     }
+    if layers & LAYER_FORCES != 0 {
+        out += "<h2>Plate forces</h2>";
+        out += &arrow(
+            &rgba_css(SLAB_PULL_COLOR),
+            "Slab pull: a sinking slab pulls its plate",
+        );
+        out += &arrow(
+            &rgba_css(RIDGE_PUSH_COLOR),
+            "Ridge push: about a tenth as strong",
+        );
+        let _ = write!(
+            out,
+            "<p>One arrow per uninterrupted stretch of boundary between two plates, \
+             showing the stretch's summed force: 1,000 km of trench sinking 100 Myr \
+             seafloor spans {FORCE_ARROW_DEG_PER_1000_KM:.0}° of arc.</p>"
+        );
+    }
     let arrow_note = format!(
         "<p>Length grows with speed: 10 cm/yr spans {:.1}° of arc.</p>",
         10.0 * ARROW_DEG_PER_CM_YEAR
@@ -123,6 +216,10 @@ pub fn html(color_mode: u32, layers: u32, plates: &[PlateKey]) -> String {
         out += &arrow(&rgba_css(MANTLE_FLOW_COLOR), "Convection under the plates");
         out += &arrow_note;
     }
+    if layers & LAYER_CRATONS != 0 {
+        out += "<h2>Craton outlines</h2>";
+        out += &line(&rgba_css(CRATON_COLOR), "Edge of Archean craton crust");
+    }
     if layers & LAYER_PROVINCES != 0 {
         out += "<h2>Deep mantle provinces</h2>";
         out += &line(
@@ -131,21 +228,37 @@ pub fn html(color_mode: u32, layers: u32, plates: &[PlateKey]) -> String {
         );
         out += "<p>Strong plumes rise from their edges.</p>";
     }
+    // Hotspot kinds share colors between the rings and the tracks.
+    let kinds = [
+        (PlumeKind::Primary, 14, "Primary: deep, from province edges"),
+        (
+            PlumeKind::Secondary,
+            11,
+            "Secondary: from domes over provinces",
+        ),
+        (
+            PlumeKind::Tertiary,
+            8,
+            "Tertiary: shallow, near ridges and rifts",
+        ),
+    ];
     if layers & LAYER_HOTSPOTS != 0 {
         out += "<h2>Hotspots</h2>";
-        let css = rgba_css(HOTSPOT_COLOR);
-        out += &ring(&css, 14, 1.0, "Strong plume (deep, Hawaii-like)");
-        out += &ring(&css, 8, 0.55, "Weak plume");
+        for (kind, size, label) in kinds {
+            out += &ring(&rgba_css(hotspot_color(kind)), size, label);
+        }
     }
     if layers & LAYER_TRACKS != 0 {
         out += "<h2>Hotspot tracks</h2>";
-        out += &line(
-            &rgba_css(HOTSPOT_COLOR),
-            "Volcanoes carried away from the plume",
-        );
+        for (kind, _, label) in kinds {
+            out += &line(
+                &rgba_css(hotspot_color(kind)),
+                label.split(':').next().unwrap_or(label),
+            );
+        }
         let _ = write!(
             out,
-            "<p>Ticks every {TRACK_TICK_MYR} Myr of age; fainter for weak plumes.</p>"
+            "<p>Volcanoes carried away from the plume; ticks every {TRACK_TICK_MYR} Myr of age.</p>"
         );
     }
     if layers & LAYER_GRATICULE != 0 {
@@ -201,10 +314,10 @@ fn line(css: &str, label: &str) -> String {
     format!("<div class=\"row\"><i class=\"line\" style=\"background:{css}\"></i>{label}</div>")
 }
 
-fn ring(css: &str, size_px: u32, opacity: f32, label: &str) -> String {
+fn ring(css: &str, size_px: u32, label: &str) -> String {
     format!(
         "<div class=\"row\"><i class=\"ring\" style=\"width:{size_px}px;height:{size_px}px;\
-         border-color:{css};opacity:{opacity}\"></i>{label}</div>"
+         border-color:{css}\"></i>{label}</div>"
     )
 }
 
@@ -245,6 +358,27 @@ mod tests {
     }
 
     #[test]
+    fn province_mode_and_cratons() {
+        let h = html(COLOR_PROVINCE, LAYER_CRATONS, &[]);
+        for p in CrustProvince::ALL {
+            assert!(h.contains(p.name()));
+        }
+        assert!(h.contains("Craton outlines"));
+    }
+
+    #[test]
+    fn lithosphere_modes() {
+        let rock = html(COLOR_ROCK, 0, &[]);
+        for r in SurfaceRock::ALL {
+            assert!(rock.contains(r.name()), "{}", r.name());
+        }
+        assert!(html(COLOR_COMPOSITION, 0, &[]).contains("granitic"));
+        assert!(html(COLOR_LITHOSPHERE, 0, &[]).contains("\u{2265}250 km"));
+        let b = html(COLOR_BUOYANCY, 0, &[]);
+        assert!(b.contains("\u{2264}\u{2212}500 kg/m³") && b.contains("12 Myr"));
+    }
+
+    #[test]
     fn deep_earth_layers() {
         let h = html(
             COLOR_MANTLE,
@@ -252,8 +386,8 @@ mod tests {
             &[],
         );
         assert!(h.contains("Mantle (rising / sinking)") && h.contains("+800 m"));
-        assert!(h.contains("Deep mantle provinces") && h.contains("Strong plume"));
-        assert!(h.contains("Ticks every 10 Myr"));
+        assert!(h.contains("Deep mantle provinces") && h.contains("Primary: deep"));
+        assert!(h.contains("ticks every 10 Myr"));
     }
 
     #[test]

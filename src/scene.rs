@@ -3,12 +3,18 @@
 use bytemuck::{Pod, Zeroable};
 use glam::DVec3;
 
+use crate::crust::CrustProvince;
 use crate::geo::{LonLat, great_circle_arc};
 use crate::mantle::CM_PER_YEAR;
 use crate::mantle::Province;
 use crate::measure::Measure;
-use crate::tectonics::{Boundary, BoundaryKind, Edge, RADIUS_KM};
-use crate::world::Hotspot;
+use std::collections::HashMap;
+use std::collections::hash_map::Entry;
+
+use crate::tectonics::{
+    Boundary, BoundaryForce, BoundaryKind, Edge, ForceKind, RADIUS_KM, SLAB_PULL,
+};
+use crate::world::{Hotspot, PlumeKind};
 
 /// Outlines float this far above the surface (fraction of radius) so they
 /// don't z-fight with the globe's facets.
@@ -18,6 +24,8 @@ const ARC_STEP_DEG: f64 = 0.5;
 
 const CURSOR_COLOR: [f32; 4] = [0.9, 0.1, 0.1, 1.0];
 const MEASURE_COLOR: [f32; 4] = [0.2, 0.9, 1.0, 1.0];
+/// Where the cursor is along the measurement, from the cross-section.
+const PROBE_COLOR: [f32; 4] = [1.0, 0.85, 0.2, 1.0];
 /// The line while it still follows the cursor.
 const MEASURING_COLOR: [f32; 4] = [0.2, 0.9, 1.0, 0.6];
 /// Arrow length per cm/yr of speed (degrees of arc), and the cap.
@@ -26,18 +34,90 @@ const ARROW_MAX_DEG: f64 = 7.0;
 pub const PLATE_MOTION_COLOR: [f32; 4] = [0.95, 0.95, 0.95, 0.9];
 pub const MANTLE_FLOW_COLOR: [f32; 4] = [1.0, 0.55, 0.85, 0.9];
 pub const PROVINCE_COLOR: [f32; 4] = [0.6, 0.2, 1.0, 1.0];
-pub const HOTSPOT_COLOR: [f32; 4] = [1.0, 0.35, 0.0, 1.0];
-/// Weak plumes and tracks are drawn fainter.
-const WEAK_ALPHA: f32 = 0.55;
-/// Hotspot ring radii (km) for a strong and a weak plume.
-const RING_STRONG_KM: f64 = 250.0;
-const RING_WEAK_KM: f64 = 110.0;
+pub const CRATON_COLOR: [f32; 4] = [0.75, 0.95, 0.2, 1.0];
+pub const SLAB_PULL_COLOR: [f32; 4] = [1.0, 0.3, 0.55, 1.0];
+pub const RIDGE_PUSH_COLOR: [f32; 4] = [0.45, 0.85, 1.0, 1.0];
+/// Force arrows: length (degrees of arc) for the summed pull of 1,000 km of
+/// trench sinking 100 Myr seafloor; the shortest and longest drawn.
+pub const FORCE_ARROW_DEG_PER_1000_KM: f64 = 4.0;
+const MIN_FORCE_ARROW_DEG: f64 = 0.5;
+const MAX_FORCE_ARROW_DEG: f64 = 15.0;
+/// Forces along a run that mostly cancel (net under this share of their
+/// total) draw no arrow.
+const MIN_NET_SHARE: f64 = 0.05;
+/// Hotspot rings and tracks by plume kind, on a heat scale: the deepest,
+/// hottest kind brightest. Ring radius (km) shrinks with kind too.
+pub fn hotspot_color(kind: PlumeKind) -> [f32; 4] {
+    match kind {
+        PlumeKind::Primary => [1.0, 0.9, 0.55, 1.0],
+        PlumeKind::Secondary => [1.0, 0.4, 0.0, 1.0],
+        PlumeKind::Tertiary => [0.65, 0.04, 0.02, 1.0],
+    }
+}
+
+fn ring_km(kind: PlumeKind) -> f64 {
+    match kind {
+        PlumeKind::Primary => 250.0,
+        PlumeKind::Secondary => 170.0,
+        PlumeKind::Tertiary => 110.0,
+    }
+}
 /// Track ticks: one every this many Myr, this long either side (km).
 pub const TRACK_TICK_MYR: usize = 10;
 const TRACK_TICK_KM: f64 = 60.0;
 
-fn faint(c: [f32; 4]) -> [f32; 4] {
-    [c[0], c[1], c[2], c[3] * WEAK_ALPHA]
+/// Force kind, acting plate and other plate: forces in one run share these.
+type RunGroup = (u8, u32, u32);
+
+/// Groups forces into uninterrupted runs: same kind, acting on the same
+/// plate against the same other plate, with edges sharing endpoints.
+fn force_runs<'f>(
+    forces: &[&'f BoundaryForce],
+    edges: &[Edge],
+    cell_plate: &[u32],
+) -> Vec<Vec<&'f BoundaryForce>> {
+    let group = |f: &BoundaryForce| -> RunGroup {
+        let e = &edges[f.edge as usize];
+        let other = if f.cell == e.a { e.b } else { e.a };
+        (
+            f.kind as u8,
+            cell_plate[f.cell as usize],
+            cell_plate[other as usize],
+        )
+    };
+    // Edge endpoints, rounded so shared vertices compare equal.
+    let key = |p: DVec3| (p * 1e6).round().as_i64vec3().to_array();
+    let mut parent: Vec<usize> = (0..forces.len()).collect();
+    fn root(parent: &mut [usize], mut i: usize) -> usize {
+        while parent[i] != i {
+            parent[i] = parent[parent[i]];
+            i = parent[i];
+        }
+        i
+    }
+    let mut seen: HashMap<(RunGroup, [i64; 3]), usize> = HashMap::new();
+    for (i, f) in forces.iter().enumerate() {
+        let path = &edges[f.edge as usize].path;
+        for end in [path[0], path[path.len() - 1]] {
+            match seen.entry((group(f), key(end))) {
+                Entry::Occupied(o) => {
+                    let (a, b) = (root(&mut parent, i), root(&mut parent, *o.get()));
+                    parent[a] = b;
+                }
+                Entry::Vacant(v) => {
+                    v.insert(i);
+                }
+            }
+        }
+    }
+    let mut runs: HashMap<usize, Vec<&'f BoundaryForce>> = HashMap::new();
+    for (i, &f) in forces.iter().enumerate() {
+        runs.entry(root(&mut parent, i)).or_default().push(f);
+    }
+    // Deterministic order (by first edge) for stable drawing.
+    let mut runs: Vec<Vec<&BoundaryForce>> = runs.into_values().collect();
+    runs.sort_by_key(|r| r.iter().map(|f| f.edge).min());
+    runs
 }
 
 /// Line color for each boundary type; index.html shows the same as a key.
@@ -85,7 +165,16 @@ impl Scene {
 
     /// `marker_scale` (meters) sizes the column markers; callers vary it with
     /// zoom so markers keep a steady on-screen size.
-    pub fn build(measure: &Measure, hover: Option<LonLat>, radius: f64, marker_scale: f64) -> Self {
+    ///
+    /// `probe` marks a point along the finished measurement (where the
+    /// cursor is in the cross-section), highlighting the line up to it.
+    pub fn build(
+        measure: &Measure,
+        hover: Option<LonLat>,
+        probe: Option<LonLat>,
+        radius: f64,
+        marker_scale: f64,
+    ) -> Self {
         let mut scene = Scene::default();
         let marker = marker_scale;
 
@@ -106,6 +195,17 @@ impl Scene {
                 marker * 0.03,
                 marker * 0.003,
                 MEASURE_COLOR,
+            );
+        }
+
+        if let (Some(p), Some(source)) = (probe, measure.source) {
+            scene.add_path(&[source.to_unit(), p.to_unit()], false, radius, PROBE_COLOR);
+            scene.add_column(
+                p.to_unit(),
+                radius,
+                marker * 0.08,
+                marker * 0.004,
+                PROBE_COLOR,
             );
         }
 
@@ -132,6 +232,62 @@ impl Scene {
         scene.segments
     }
 
+    /// One arrow per uninterrupted stretch of boundary: slab pull or ridge
+    /// push edges acting on the same plate, against the same other plate,
+    /// joined end to end. The arrow sits at the stretch's middle edge and
+    /// shows the stretch's summed force, its length growing with the total.
+    pub fn force_arrows(
+        forces: &[BoundaryForce],
+        edges: &[Edge],
+        cell_plate: &[u32],
+        radius: f64,
+    ) -> Vec<Segment> {
+        let shown: Vec<&BoundaryForce> = forces
+            .iter()
+            .filter(|f| {
+                matches!(f.kind, ForceKind::SlabPull | ForceKind::RidgePush) && f.strength > 0.0
+            })
+            .collect();
+        let mut scene = Scene::default();
+        for run in force_runs(&shown, edges, cell_plate) {
+            let net: DVec3 = run.iter().map(|f| f.dir * f.strength * f.length_km).sum();
+            let total: f64 = run.iter().map(|f| f.strength * f.length_km).sum();
+            // Anchor at the edge nearest the run's middle.
+            let center = run.iter().map(|f| f.at).sum::<DVec3>().normalize_or_zero();
+            let anchor = run
+                .iter()
+                .max_by(|a, b| a.at.dot(center).total_cmp(&b.at.dot(center)))
+                .map_or(center, |f| f.at);
+            let flat = net - anchor * anchor.dot(net);
+            if flat.length() < MIN_NET_SHARE * total {
+                continue;
+            }
+            let deg = (FORCE_ARROW_DEG_PER_1000_KM * flat.length() / SLAB_PULL / 1000.0)
+                .clamp(MIN_FORCE_ARROW_DEG, MAX_FORCE_ARROW_DEG);
+            let color = match run[0].kind {
+                ForceKind::SlabPull => SLAB_PULL_COLOR,
+                _ => RIDGE_PUSH_COLOR,
+            };
+            scene.add_arrow(anchor, flat.normalize(), deg.to_radians(), radius, color);
+        }
+        scene.segments
+    }
+
+    /// Outlines of the Archean cratons: every cell edge between craton and
+    /// non-craton crust.
+    pub fn craton_outlines(
+        edges: &[Edge],
+        province: &[CrustProvince],
+        radius: f64,
+    ) -> Vec<Segment> {
+        let mut scene = Scene::default();
+        let craton = |c: u32| province[c as usize] == CrustProvince::Archean;
+        for e in edges.iter().filter(|e| craton(e.a) != craton(e.b)) {
+            scene.add_path(&e.path, false, radius, CRATON_COLOR);
+        }
+        scene.segments
+    }
+
     /// Outlines of the deep mantle provinces.
     pub fn province_outlines(provinces: &[Province], radius: f64) -> Vec<Segment> {
         let mut scene = Scene::default();
@@ -141,16 +297,12 @@ impl Scene {
         scene.segments
     }
 
-    /// A ring around each plume, larger and bolder for strong plumes.
+    /// A ring around each plume, colored and sized by its kind.
     pub fn hotspot_rings(hotspots: &[Hotspot], radius: f64) -> Vec<Segment> {
         let mut scene = Scene::default();
         for h in hotspots {
-            let (km, color) = if h.is_strong() {
-                (RING_STRONG_KM, HOTSPOT_COLOR)
-            } else {
-                (RING_WEAK_KM, faint(HOTSPOT_COLOR))
-            };
-            let r = km / RADIUS_KM;
+            let color = hotspot_color(h.kind);
+            let r = ring_km(h.kind) / RADIUS_KM;
             let u = h.position.any_orthonormal_vector();
             let v = h.position.cross(u);
             let ring: Vec<DVec3> = (0..32)
@@ -174,11 +326,7 @@ impl Scene {
         let mut scene = Scene::default();
         let tick = TRACK_TICK_KM / RADIUS_KM;
         for (h, track) in hotspots.iter().zip(tracks) {
-            let color = if h.is_strong() {
-                HOTSPOT_COLOR
-            } else {
-                faint(HOTSPOT_COLOR)
-            };
+            let color = hotspot_color(h.kind);
             scene.add_path(track, false, radius, color);
             for i in (TRACK_TICK_MYR..track.len()).step_by(TRACK_TICK_MYR) {
                 let p = track[i];
@@ -213,20 +361,24 @@ impl Scene {
             let length = (speed * ARROW_DEG_PER_CM_YEAR)
                 .min(ARROW_MAX_DEG)
                 .to_radians();
-            let dir = v.normalize();
-            let tip = p * length.cos() + dir * length.sin();
-            scene.add_path(&[p, tip], false, radius, color);
-            // Two barbs swept back from the tip.
-            let back = (p - tip * p.dot(tip)).normalize();
-            let side = tip.cross(back);
-            let barb = 0.35 * length;
-            for s in [-1.0, 1.0] {
-                let d = (back * 0.9 + side * (0.45 * s)).normalize();
-                let end = tip * barb.cos() + d * barb.sin();
-                scene.add_path(&[tip, end], false, radius, color);
-            }
+            scene.add_arrow(p, v.normalize(), length, radius, color);
         }
         scene.segments
+    }
+
+    /// An arrow from `p` along tangent `dir`, `length` radians long.
+    fn add_arrow(&mut self, p: DVec3, dir: DVec3, length: f64, radius: f64, color: [f32; 4]) {
+        let tip = p * length.cos() + dir * length.sin();
+        self.add_path(&[p, tip], false, radius, color);
+        // Two barbs swept back from the tip.
+        let back = (p - tip * p.dot(tip)).normalize();
+        let side = tip.cross(back);
+        let barb = 0.35 * length;
+        for s in [-1.0, 1.0] {
+            let d = (back * 0.9 + side * (0.45 * s)).normalize();
+            let end = tip * barb.cos() + d * barb.sin();
+            self.add_path(&[tip, end], false, radius, color);
+        }
     }
 
     fn add_path(&mut self, points: &[DVec3], closed: bool, radius: f64, color: [f32; 4]) {
@@ -278,7 +430,7 @@ mod tests {
         let mut m = Measure::default();
         m.click(LonLat::new(0.0, 0.0));
         let hover = Some(LonLat::new(10.0, 0.0));
-        let s = Scene::build(&m, hover, EARTH_RADIUS_M, EARTH_RADIUS_M);
+        let s = Scene::build(&m, hover, None, EARTH_RADIUS_M, EARTH_RADIUS_M);
         assert!(s.segments.len() > 3, "great circle is densified");
         assert!(s.segments.iter().all(|seg| seg.color == MEASURING_COLOR));
         for w in s.segments.windows(2) {
@@ -289,7 +441,17 @@ mod tests {
         assert_eq!(s.columns[1].color, CURSOR_COLOR);
 
         m.click(LonLat::new(10.0, 0.0));
-        let s = Scene::build(&m, None, EARTH_RADIUS_M, EARTH_RADIUS_M);
+        let s = Scene::build(&m, None, None, EARTH_RADIUS_M, EARTH_RADIUS_M);
+        // A probe along the line adds its marker and highlight.
+        let probe = Scene::build(
+            &m,
+            None,
+            Some(LonLat::new(5.0, 0.0)),
+            EARTH_RADIUS_M,
+            EARTH_RADIUS_M,
+        );
+        assert_eq!(probe.columns.len(), 3);
+        assert!(probe.segments.iter().any(|seg| seg.color == PROBE_COLOR));
         assert!(s.segments.iter().all(|seg| seg.color == MEASURE_COLOR));
         assert_eq!(s.columns.len(), 2, "both ends marked");
     }
@@ -297,6 +459,7 @@ mod tests {
     #[test]
     fn hotspot_track_has_a_tick_every_ten_myr() {
         let h = Hotspot {
+            kind: PlumeKind::Primary,
             position: DVec3::X,
             strength: 1.0,
         };
@@ -323,9 +486,96 @@ mod tests {
         );
     }
 
+    /// Subduction all along the equator, the south plate sinking north.
+    fn equator_trench() -> (Vec<Edge>, Vec<Boundary>) {
+        let grid = crate::grid::Grid::new(h3o::Resolution::Two);
+        let edges = crate::tectonics::edges(&grid);
+        let south = |c: u32| grid.centers[c as usize].y < 0.0;
+        let boundaries = edges
+            .iter()
+            .enumerate()
+            .filter(|(_, e)| south(e.a) != south(e.b))
+            .map(|(i, e)| Boundary {
+                edge: i as u32,
+                kind: BoundaryKind::Subduction,
+                rate: 5.0,
+                subducting: if south(e.a) { e.a } else { e.b },
+                normal: e.normal,
+            })
+            .collect();
+        (edges, boundaries)
+    }
+
+    /// Slab pull north across every edge of `trench`, from the south plate.
+    fn pulls(
+        edges: &[Edge],
+        trench: &[Boundary],
+        south: impl Fn(u32) -> bool,
+    ) -> Vec<BoundaryForce> {
+        trench
+            .iter()
+            .map(|b| {
+                let e = &edges[b.edge as usize];
+                BoundaryForce {
+                    kind: ForceKind::SlabPull,
+                    edge: b.edge,
+                    cell: if south(e.a) { e.a } else { e.b },
+                    at: e.mid,
+                    dir: (DVec3::Y - e.mid * e.mid.y).normalize(),
+                    strength: SLAB_PULL,
+                    length: 1.0,
+                    length_km: e.length * RADIUS_KM,
+                }
+            })
+            .collect()
+    }
+
+    #[test]
+    fn one_arrow_per_uninterrupted_run() {
+        let grid = crate::grid::Grid::new(h3o::Resolution::Two);
+        let (edges, boundaries) = equator_trench();
+        let cell_plate: Vec<u32> = grid.centers.iter().map(|c| u32::from(c.y < 0.0)).collect();
+        let south = |c: u32| grid.centers[c as usize].y < 0.0;
+        let arrows = |trench: Vec<Boundary>| {
+            Scene::force_arrows(&pulls(&edges, &trench, south), &edges, &cell_plate, 1.0)
+        };
+        let on = |x: f64| -> Vec<Boundary> {
+            boundaries
+                .iter()
+                .copied()
+                .filter(|b| edges[b.edge as usize].mid.x * x.signum() > x.abs())
+                .collect()
+        };
+        // Two separate stretches of trench give two arrows, each pointing
+        // north (the shaft's far end is the northernmost point drawn).
+        let one = arrows(on(0.5));
+        let two = arrows([on(0.5), on(-0.5)].concat());
+        assert!(!one.is_empty());
+        assert_eq!(two.len(), 2 * one.len());
+        let tip = one.iter().map(|s| s.b[1]).fold(f32::MIN, f32::max);
+        assert!(tip > 0.01, "points north: {tip}");
+        // Pulls that oppose each other along one stretch cancel: no arrow.
+        let mut opposed = pulls(&edges, &on(0.5), south);
+        for (i, f) in opposed.iter_mut().enumerate() {
+            if i % 2 == 1 {
+                f.dir = -f.dir;
+            }
+        }
+        if opposed.len() % 2 == 1 {
+            opposed.pop();
+        }
+        assert!(Scene::force_arrows(&opposed, &edges, &cell_plate, 1.0).is_empty());
+    }
+
     #[test]
     fn nothing_without_measurement_or_cursor() {
-        let s = Scene::build(&Measure::default(), None, EARTH_RADIUS_M, EARTH_RADIUS_M);
+        let s = Scene::build(
+            &Measure::default(),
+            None,
+            None,
+            EARTH_RADIUS_M,
+            EARTH_RADIUS_M,
+        );
         assert!(s.segments.is_empty() && s.columns.is_empty());
     }
 }

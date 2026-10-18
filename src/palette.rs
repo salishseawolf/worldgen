@@ -64,6 +64,54 @@ pub const MANTLE: &[Stop] = &[
     stop(800.0, 0.75, 0.15, 0.10),
 ];
 
+/// Crust composition (felsic fraction): dark basalt to pale pink granite.
+pub const COMPOSITION: &[Stop] = &[
+    stop(0.0, 0.20, 0.22, 0.27),
+    stop(0.5, 0.62, 0.55, 0.60),
+    stop(1.0, 0.96, 0.75, 0.75),
+];
+
+/// Lithosphere thickness (km): pale and thin to dark and deep-rooted.
+pub const LITHOSPHERE: &[Stop] = &[
+    stop(0.0, 0.95, 0.92, 0.80),
+    stop(50.0, 0.80, 0.70, 0.45),
+    stop(100.0, 0.55, 0.45, 0.30),
+    stop(160.0, 0.35, 0.28, 0.25),
+    stop(250.0, 0.15, 0.12, 0.15),
+];
+
+/// Column density minus the asthenosphere's (kg/m³): purple floats,
+/// orange is heavy enough to sink. Purple and orange keep clear of the
+/// mantle view's blue and red.
+pub const BUOYANCY: &[Stop] = &[
+    stop(-500.0, 0.35, 0.15, 0.55),
+    stop(-200.0, 0.65, 0.55, 0.80),
+    stop(0.0, 0.80, 0.80, 0.80),
+    stop(50.0, 0.95, 0.70, 0.40),
+    stop(100.0, 0.85, 0.40, 0.05),
+];
+
+/// Surface rock colors, in the order of `SurfaceRock::ALL`: muted, after
+/// geologic-map convention (granite pink), and no biome greens.
+pub const ROCK: [[f64; 3]; 7] = [
+    [0.62, 0.70, 0.78],
+    [0.25, 0.27, 0.32],
+    [0.55, 0.48, 0.62],
+    [0.93, 0.62, 0.62],
+    [0.55, 0.38, 0.45],
+    [0.85, 0.72, 0.42],
+    [0.45, 0.22, 0.18],
+];
+
+/// Crustal age provinces, in the order of `CrustProvince::ALL`: oceanic,
+/// then Archean (deep red-brown) to Phanerozoic (pale), older darker.
+pub const PROVINCE: [[f64; 3]; 4] = [
+    [0.25, 0.38, 0.55],
+    [0.62, 0.25, 0.28],
+    [0.85, 0.58, 0.35],
+    [0.90, 0.86, 0.58],
+];
+
 /// Oceanic crust in the crust view.
 pub const OCEANIC_CRUST: [f64; 3] = [0.20, 0.36, 0.62];
 
@@ -75,8 +123,13 @@ pub const ELEVATION_AT: usize = 0;
 pub const AGE_AT: usize = RAMP_LEN;
 pub const THICKNESS_AT: usize = 2 * RAMP_LEN;
 pub const MANTLE_AT: usize = 3 * RAMP_LEN;
-pub const NO_AGE_AT: usize = 4 * RAMP_LEN;
-pub const OCEANIC_CRUST_AT: usize = 4 * RAMP_LEN + 1;
+pub const COMPOSITION_AT: usize = 4 * RAMP_LEN;
+pub const LITHOSPHERE_AT: usize = 5 * RAMP_LEN;
+pub const BUOYANCY_AT: usize = 6 * RAMP_LEN;
+pub const NO_AGE_AT: usize = 7 * RAMP_LEN;
+pub const OCEANIC_CRUST_AT: usize = 7 * RAMP_LEN + 1;
+pub const ROCK_AT: usize = 7 * RAMP_LEN + 2;
+pub const PROVINCE_AT: usize = ROCK_AT + ROCK.len();
 
 /// All ramps and fixed colors as `[r, g, b, value]` in linear RGB, for the
 /// shader.
@@ -85,12 +138,15 @@ pub fn gpu_table() -> Vec<[f32; 4]> {
         let [r, g, b] = srgb.map(srgb_to_linear);
         [r as f32, g as f32, b as f32, value as f32]
     };
-    let mut table = vec![[0.0; 4]; OCEANIC_CRUST_AT + 1];
+    let mut table = vec![[0.0; 4]; PROVINCE_AT + PROVINCE.len()];
     for (at, ramp) in [
         (ELEVATION_AT, ELEVATION),
         (AGE_AT, AGE),
         (THICKNESS_AT, THICKNESS),
         (MANTLE_AT, MANTLE),
+        (COMPOSITION_AT, COMPOSITION),
+        (LITHOSPHERE_AT, LITHOSPHERE),
+        (BUOYANCY_AT, BUOYANCY),
     ] {
         assert!(ramp.len() <= RAMP_LEN);
         let last = ramp[ramp.len() - 1];
@@ -101,6 +157,12 @@ pub fn gpu_table() -> Vec<[f32; 4]> {
     }
     table[NO_AGE_AT] = entry(NO_AGE, 0.0);
     table[OCEANIC_CRUST_AT] = entry(OCEANIC_CRUST, 0.0);
+    for (i, &color) in ROCK.iter().enumerate() {
+        table[ROCK_AT + i] = entry(color, 0.0);
+    }
+    for (i, &color) in PROVINCE.iter().enumerate() {
+        table[PROVINCE_AT + i] = entry(color, 0.0);
+    }
     table
 }
 
@@ -137,7 +199,15 @@ mod tests {
 
     #[test]
     fn ramps_ascend() {
-        for ramp in [ELEVATION, AGE, THICKNESS, MANTLE] {
+        for ramp in [
+            ELEVATION,
+            AGE,
+            THICKNESS,
+            MANTLE,
+            COMPOSITION,
+            LITHOSPHERE,
+            BUOYANCY,
+        ] {
             assert!(ramp.windows(2).all(|w| w[0].value < w[1].value));
         }
     }
@@ -145,7 +215,7 @@ mod tests {
     #[test]
     fn table_layout() {
         let t = gpu_table();
-        assert_eq!(t.len(), OCEANIC_CRUST_AT + 1);
+        assert_eq!(t.len(), PROVINCE_AT + PROVINCE.len());
         assert_eq!(t[ELEVATION_AT][3], -8000.0);
         // Short ramps pad with their last stop.
         assert_eq!(t[THICKNESS_AT + RAMP_LEN - 1], t[THICKNESS_AT + 2]);
@@ -159,6 +229,11 @@ mod tests {
             ("AGE_AT", AGE_AT),
             ("THICKNESS_AT", THICKNESS_AT),
             ("MANTLE_AT", MANTLE_AT),
+            ("COMPOSITION_AT", COMPOSITION_AT),
+            ("LITHOSPHERE_AT", LITHOSPHERE_AT),
+            ("BUOYANCY_AT", BUOYANCY_AT),
+            ("ROCK_AT", ROCK_AT),
+            ("PROVINCE_AT", PROVINCE_AT),
             ("NO_AGE_AT", NO_AGE_AT),
             ("OCEANIC_CRUST_AT", OCEANIC_CRUST_AT),
             ("RAMP_LEN", RAMP_LEN),

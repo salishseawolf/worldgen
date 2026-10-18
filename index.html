@@ -31,6 +31,35 @@
         border-radius: 6px; padding: 3px 10px; cursor: pointer;
       }
       .tray button:hover { background: #2c3347; }
+      /* Cross-section panel, filled in by cross_section.rs. It sits between
+         the left panel and the right-hand cards. */
+      #section {
+        position: fixed; bottom: 12px; left: 324px; right: 284px; max-width: 760px;
+        font-size: 12px; user-select: none;
+      }
+      #section h2 { margin: 0 0 4px; font-size: 11px; font-weight: 600; letter-spacing: 0.06em; text-transform: uppercase; color: #8a93a6; }
+      #section svg { display: block; }
+      #section .head { display: flex; align-items: center; justify-content: space-between; gap: 8px; }
+      #section .chart { position: relative; cursor: crosshair; touch-action: none; }
+      #section-brush {
+        position: absolute; pointer-events: none;
+        background: rgba(77, 230, 255, 0.15); border: 1px solid rgba(77, 230, 255, 0.8);
+      }
+      #section-guide {
+        position: absolute; top: 0; bottom: 0; width: 0; pointer-events: none;
+        border-left: 1px dashed rgba(255, 217, 51, 0.9);
+      }
+      #section-readout { margin-top: 2px; font-size: 11px; font-variant-numeric: tabular-nums; color: #ffd933; }
+      #section-reset {
+        font: inherit; font-size: 11px; color: #ddd; background: #232838; border: 1px solid #39405a;
+        border-radius: 6px; padding: 1px 8px; cursor: pointer;
+      }
+      #section .axis { fill: #a9b0c0; font-size: 10px; font-variant-numeric: tabular-nums; }
+      #section .sea { stroke: #cfd8e8; stroke-width: 0.6; stroke-dasharray: 3 2; }
+      #section .marker { stroke-width: 1.2; stroke-dasharray: 4 3; }
+      #section .slab { opacity: 0.85; stroke: #e8d8c8; stroke-width: 0.6; stroke-dasharray: 3 2; }
+      #section p { margin: 0; }
+      #section .note { color: #8a93a6; font-size: 11px; margin-top: 2px; }
       /* Performance panel, filled in by web.rs. */
       #perf {
         position: fixed; right: 12px; bottom: 12px; width: min(260px, calc(100vw - 24px));
@@ -65,10 +94,21 @@
       @media (max-width: 700px) {
         #legend { top: auto; bottom: 12px; max-height: 40vh; }
         #perf { bottom: auto; top: 12px; }
+        #section { left: 12px; right: 12px; bottom: auto; top: 12px; }
       }
       #hud-cursor { font-variant-numeric: tabular-nums; font-weight: 600; }
       #hud-cell { font-variant-numeric: tabular-nums; }
-      #hud-cell:empty, #hud-crust:empty, #hud-deep:empty { display: none; }
+      #hud-cell:empty, #hud-crust:empty, #hud-deep:empty, #hud-rock:empty, #hud-boundary:empty { display: none; }
+      .tray select {
+        width: 100%; font: inherit; color: #ddd; background: #232838;
+        border: 1px solid #39405a; border-radius: 6px; padding: 3px 6px; margin: 2px 0 4px;
+      }
+      /* Column inspector, filled in by column_view.rs. */
+      #inspector { pointer-events: none; }
+      #inspector svg { display: block; font-size: 11px; font-variant-numeric: tabular-nums; }
+      #inspector text { fill: #ddd; }
+      #inspector text.dim { fill: #8a93a6; }
+      #inspector rect { stroke: rgba(0, 0, 0, 0.35); stroke-width: 0.5; }
       #hud-crust { font-variant-numeric: tabular-nums; }
       #measure .head { display: flex; align-items: center; justify-content: space-between; margin-bottom: 4px; }
       #measure h2 { margin: 0; font-size: 11px; font-weight: 600; letter-spacing: 0.06em; text-transform: uppercase; color: #8a93a6; }
@@ -94,11 +134,17 @@
         <div id="hud-cursor"></div>
         <div id="hud-cell"></div>
         <div id="hud-crust"></div>
+        <div id="hud-rock"></div>
+        <div id="hud-boundary"></div>
         <div id="hud-deep"></div>
         <div class="help">
           Drag: move · Wheel: zoom<br />
           Click: measure from a point, click again to finish
         </div>
+      </div>
+      <div id="inspector" class="card" hidden>
+        <div class="help" style="margin-bottom: 4px">Column under the cursor</div>
+        <div id="inspector-body"></div>
       </div>
       <div id="measure" class="card" hidden>
         <div class="head">
@@ -122,14 +168,32 @@
       </div>
       <div class="card tray">
         <h2>Color by</h2>
-        <label><input type="radio" name="color" id="color-elevation" checked /> Elevation</label>
-        <label><input type="radio" name="color" id="color-plates" /> Plates</label>
-        <label><input type="radio" name="color" id="color-age" /> Seafloor age</label>
-        <label><input type="radio" name="color" id="color-crust" /> Crust type and thickness</label>
-        <label><input type="radio" name="color" id="color-mantle" /> Mantle (rising / sinking)</label>
+        <!-- Values match COLOR_CHOICES in web.rs. -->
+        <select id="color-mode" aria-label="Color by">
+          <optgroup label="Surface">
+            <option value="elevation" selected>Elevation</option>
+            <option value="rock">Surface rock</option>
+            <option value="age">Seafloor age</option>
+          </optgroup>
+          <optgroup label="Crust and plates">
+            <option value="plates">Plates</option>
+            <option value="crust">Crust type and thickness</option>
+            <option value="composition">Crust composition</option>
+            <option value="province">Crustal age province</option>
+          </optgroup>
+          <optgroup label="Lithosphere">
+            <option value="lithosphere">Lithosphere thickness</option>
+            <option value="buoyancy">Buoyancy</option>
+          </optgroup>
+          <optgroup label="Deep earth">
+            <option value="mantle">Mantle (rising / sinking)</option>
+          </optgroup>
+        </select>
         <h2>Surface</h2>
         <label><input type="checkbox" id="layer-boundaries" checked /> Plate boundaries</label>
+        <label><input type="checkbox" id="layer-cratons" /> Craton outlines</label>
         <label><input type="checkbox" id="layer-motion" /> Plate motion</label>
+        <label><input type="checkbox" id="layer-forces" /> Plate forces</label>
         <label><input type="checkbox" id="layer-graticule" checked /> Graticule</label>
         <h2>Deep earth</h2>
         <label><input type="checkbox" id="layer-mantle" /> Mantle flow</label>
@@ -142,6 +206,9 @@
         <label><input type="radio" name="projection" id="proj-mercator" /> Cylindrical (Mercator)</label>
         <label><input type="radio" name="projection" id="proj-albers" /> Conic (Albers equal-area)</label>
         <label><input type="radio" name="projection" id="proj-azimuthal" /> Azimuthal (equidistant, both hemispheres)</label>
+        <h2>Inspect</h2>
+        <label><input type="checkbox" id="inspect-column" /> Column inspector</label>
+        <label><input type="checkbox" id="inspect-section" /> Cross-section along measurement</label>
         <h2>Diagnostics</h2>
         <label><input type="checkbox" id="perf-stats" /> Performance stats</label>
         <h2>World</h2>
@@ -152,6 +219,19 @@
       </div>
     </div>
     <div id="legend" class="card"></div>
+    <div id="section" class="card" hidden>
+      <div class="head">
+        <h2 id="section-title">Cross-section</h2>
+        <button type="button" id="section-reset" hidden>Reset zoom</button>
+      </div>
+      <div class="chart">
+        <div id="section-body"></div>
+        <div id="section-brush" hidden></div>
+        <div id="section-guide" hidden></div>
+      </div>
+      <div id="section-readout">Hover the chart to find the point on the globe.</div>
+      <div class="note">Drag a box to zoom (sideways: distance only; up-down: elevation or depth only); double-click to reset. Elevation strip exaggerated; below, each column hangs from its true elevation, to scale. Hover a marker for what it is.</div>
+    </div>
     <div id="perf" class="card" hidden>
       <h2>Performance</h2>
       <div id="perf-body"></div>

@@ -18,34 +18,42 @@
 
 use glam::{DQuat, DVec3};
 
-use crate::crust::{
-    self, CONTINENTAL_THICKNESS_KM, CrustKind, OCEANIC_THICKNESS_KM, continental_elevation_m,
-    ocean_depth_m,
-};
+use crate::crust::{self, Column, CrustKind, CrustProvince, SurfaceRock};
 use crate::geo::LonLat;
 use crate::grid::Grid;
-use crate::mantle::{MantleFlow, Province};
+use crate::mantle::MantleFlow;
 use crate::plates::{Plate, Plates};
 use crate::rng::{Pcg32, Stream};
 use crate::tectonics::{
-    Boundary, BoundaryKind, DEFAULT_OCEAN_AGE_MYR, Edge, RADIUS_KM, classify, flood, ocean_ages,
-    solve_motion,
+    Boundary, BoundaryForce, BoundaryKind, DEFAULT_OCEAN_AGE_MYR, Edge, RADIUS_KM, boundary_forces,
+    classify, flood, ocean_ages, solve_motion,
 };
 
 /// Rounds of classify, date, re-solve.
 const MOTION_ROUNDS: usize = 3;
 /// Sinking-slab downwellings added per this many subduction edges.
 const SLAB_SAMPLE: usize = 4;
-/// Earth has about 40 to 50 catalogued hotspots, of which only 7 to 9 look
-/// like strong plumes from deep in the mantle (Courtillot et al. 2003); the
-/// rest are weaker. Strength 1 is Hawaii-like.
-const STRONG_HOTSPOTS: usize = 8;
-const WEAK_HOTSPOTS: usize = 30;
-const STRONG_STRENGTH: (f64, f64) = (0.7, 1.0);
-const WEAK_STRENGTH: (f64, f64) = (0.1, 0.35);
-/// Strong plumes scatter this far (radians, about 190 km) around the
-/// province edge.
-const PLUME_EDGE_JITTER: f64 = 0.03;
+/// Hotspots by origin, after Courtillot et al. (2003): of Earth's 40 to 50,
+/// about 7 to 9 are primary (deep), about 20 secondary and the rest
+/// tertiary. See [`PlumeKind`].
+const PRIMARY_HOTSPOTS: usize = 8;
+const SECONDARY_HOTSPOTS: usize = 16;
+const TERTIARY_HOTSPOTS: usize = 14;
+/// Primary plumes along a province edge are evenly spaced, each shifted by
+/// up to this share of the spacing, then scattered this far (radians, about
+/// 130 km) off the outline.
+const PRIMARY_SPACING_JITTER: f64 = 0.25;
+const PLUME_EDGE_JITTER: f64 = 0.02;
+/// Tertiary plumes scatter this far (radians, about 190 km) from a ridge or
+/// rift.
+const TERTIARY_JITTER: f64 = 0.03;
+/// Attempts to find a secondary plume site before giving up on one.
+const SECONDARY_ATTEMPTS: usize = 200;
+/// Secondary plumes come off the rising domes, so their strength scales
+/// with the local mantle rise, by between this and 1.
+const MIN_UPWELLING_FACTOR: f64 = 0.6;
+/// Hotspot volcanoes younger than this (Myr) show bare lava.
+const FRESH_VOLCANO_MYR: f64 = 10.0;
 /// How far back hotspot tracks are traced (Myr).
 const HOTSPOT_TRACK_MYR: u32 = 90;
 
@@ -57,18 +65,45 @@ const TRENCH_WIDTH_KM: f64 = 70.0;
 /// Volcanic arcs stand this far behind the trench.
 const ARC_DISTANCE_KM: f64 = 180.0;
 const ARC_WIDTH_KM: f64 = 90.0;
-const ISLAND_ARC_M: f64 = 3500.0;
-/// Andes-style arcs on continents thicken the crust.
+/// Island arcs and Andes-style continental arcs thicken the crust with new
+/// crust of intermediate to felsic composition.
+const ISLAND_ARC_CRUST_KM: f64 = 12.0;
+const ISLAND_ARC_FELSIC: f64 = 0.3;
 const CONTINENTAL_ARC_KM: f64 = 28.0;
+const CONTINENTAL_ARC_FELSIC: f64 = 0.6;
 /// Collisions build a plateau this wide, then taper off.
 const COLLISION_KM: f64 = 35.0;
 const PLATEAU_KM: f64 = 300.0;
 const PLATEAU_TAPER_KM: f64 = 450.0;
 const RIFT_THINNING_KM: f64 = 12.0;
 const RIFT_WIDTH_KM: f64 = 60.0;
+/// Ocean sediment: slow open-ocean settling (km per Myr of seafloor age)
+/// plus thick wedges off continents (GlobSed: thickness grows with age and
+/// near land).
+const PELAGIC_KM_PER_MYR: f64 = 0.003;
+const MARGIN_SEDIMENT_KM: f64 = 2.5;
+const MARGIN_WIDTH_KM: f64 = 250.0;
+/// Seafloor with less sediment than this shows its basalt.
+const BARE_SEAFLOOR_KM: f64 = 0.05;
+/// Continental ground above this has had its sedimentary cover eroded off,
+/// exposing granite and gneiss basement.
+const EXPOSED_BASEMENT_M: f64 = 1200.0;
 /// Continental crust thins toward the coast into a shelf.
-const SHELF_THINNING_KM: f64 = 4.0;
-const SHELF_WIDTH_KM: f64 = 80.0;
+/// Passive margins: continents end not in a cliff but in a zone of
+/// stretched, thinned crust (shelf, slope and rise) a few hundred km wide.
+/// Continental crust thins over this width toward the coast, to this
+/// thickness at the shoreline...
+const MARGIN_CONTINENT_KM: f64 = 300.0;
+const COASTAL_CRUST_KM: f64 = 28.0;
+/// ...and the seafloor just offshore is thickened transitional crust,
+/// thinning back to normal oceanic crust over this width.
+const MARGIN_OCEAN_KM: f64 = 300.0;
+const TRANSITIONAL_CRUST_KM: f64 = 18.0;
+const TRANSITIONAL_FELSIC: f64 = 0.3;
+/// Neighbor-averaging passes that blend columns across continental province
+/// edges (each pass reaches about one cell, roughly 120 km between cell
+/// centers).
+const PROVINCE_BLEND_PASSES: usize = 2;
 /// Dynamic topography: rising mantle lifts the surface and sinking mantle
 /// (including slabs) drags it down, by up to about a kilometer over
 /// thousands of kilometers (Africa's superswell, Indonesia's low).
@@ -95,10 +130,13 @@ const VOLCANO_FLANK: f64 = 0.35;
 
 pub struct Crust {
     pub kind: Vec<CrustKind>,
-    pub thickness_km: Vec<f64>,
+    pub province: Vec<CrustProvince>,
+    /// Each cell's lithosphere: sediment, crust and mantle lithosphere.
+    pub column: Vec<Column>,
     /// Oceanic crust age (Myr); 0 for continental cells.
     pub age_myr: Vec<f64>,
     pub elevation_m: Vec<f64>,
+    pub rock: Vec<SurfaceRock>,
 }
 
 pub struct World {
@@ -106,6 +144,8 @@ pub struct World {
     pub crust: Crust,
     pub mantle: MantleFlow,
     pub boundaries: Vec<Boundary>,
+    /// The boundary forces behind the plates' motion, for display.
+    pub forces: Vec<BoundaryForce>,
     pub hotspots: Vec<Hotspot>,
     /// Each hotspot's track: where the plate now carries ground that sat
     /// over the plume 0, 1, 2, ... Myr ago, while it stays on that plate.
@@ -125,9 +165,44 @@ pub struct HotspotMark {
     pub age_myr: f64,
 }
 
+/// Where a plume comes from, after Courtillot et al. (2003).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum PlumeKind {
+    /// Deep plumes from the edges of the deep mantle provinces (Hawaii,
+    /// Iceland, Afar, Réunion).
+    Primary,
+    /// Smaller plumes off the tops of the broad domes above the provinces
+    /// (the island chains over the Pacific superswell).
+    Secondary,
+    /// Shallow melting where the plate is being stretched: near ridges and
+    /// rifts.
+    Tertiary,
+}
+
+impl PlumeKind {
+    pub fn name(self) -> &'static str {
+        match self {
+            PlumeKind::Primary => "primary",
+            PlumeKind::Secondary => "secondary",
+            PlumeKind::Tertiary => "tertiary",
+        }
+    }
+
+    /// Strength range; draws are skewed toward the low end, since most
+    /// hotspots are weak and a few very strong (Sleep 1990).
+    fn strength_range(self) -> (f64, f64) {
+        match self {
+            PlumeKind::Primary => (0.6, 1.0),
+            PlumeKind::Secondary => (0.25, 0.6),
+            PlumeKind::Tertiary => (0.1, 0.35),
+        }
+    }
+}
+
 /// A mantle plume, fixed in the mantle.
 #[derive(Clone, Copy, Debug)]
 pub struct Hotspot {
+    pub kind: PlumeKind,
     pub position: DVec3,
     /// 0 to 1; 1 is Hawaii-like. Scales the swell and volcanoes, and weaker
     /// plumes' volcanoes are also shorter-lived.
@@ -135,30 +210,97 @@ pub struct Hotspot {
 }
 
 impl Hotspot {
-    /// The world's plumes. Strong ones rise from the edges of the deep
-    /// mantle provinces, taking turns between them; weak ones anywhere.
-    fn scatter(seed: u64, provinces: &[Province]) -> Vec<Self> {
+    /// The world's plumes, each placed by where its kind comes from:
+    /// primaries spaced along the province edges (more on the larger one),
+    /// secondaries inside the provinces where the mantle rises fastest,
+    /// tertiaries near ridges and rifts.
+    fn scatter(
+        seed: u64,
+        mantle: &MantleFlow,
+        edges: &[Edge],
+        boundaries: &[Boundary],
+    ) -> Vec<Self> {
         let mut rng = Pcg32::for_part(seed, Stream::Hotspots);
-        let mut spots: Vec<Self> = (0..STRONG_HOTSPOTS)
-            .map(|i| {
-                let province = &provinces[i % provinces.len()];
-                let edge = province.edge_point(rng.range(0.0, std::f64::consts::TAU));
-                let jitter = rng.unit_vector() * PLUME_EDGE_JITTER;
-                Self {
-                    position: (edge + jitter).normalize(),
-                    strength: rng.range(STRONG_STRENGTH.0, STRONG_STRENGTH.1),
-                }
-            })
-            .collect();
-        spots.extend((0..WEAK_HOTSPOTS).map(|_| Self {
-            position: rng.unit_vector(),
-            strength: rng.range(WEAK_STRENGTH.0, WEAK_STRENGTH.1),
-        }));
-        spots
-    }
+        let provinces = &mantle.provinces;
+        // Upwelling at a province center is about the strongest anywhere.
+        let peak_rise = provinces
+            .iter()
+            .map(|p| mantle.upwelling(p.center))
+            .fold(1e-12, f64::max);
+        // Only secondaries depend on the dome they rise from: primaries are
+        // fed from the base of the mantle, tertiaries by shallow stretching.
+        let strength = |rng: &mut Pcg32, kind: PlumeKind, at: DVec3| {
+            let (lo, hi) = kind.strength_range();
+            let skewed = lo + (hi - lo) * rng.next_f64().powi(2);
+            if kind != PlumeKind::Secondary {
+                return skewed;
+            }
+            let rise = (mantle.upwelling(at) / peak_rise).clamp(0.0, 1.0);
+            skewed * (MIN_UPWELLING_FACTOR + (1.0 - MIN_UPWELLING_FACTOR) * rise)
+        };
+        let mut spots = Vec::new();
+        let mut add = |rng: &mut Pcg32, kind: PlumeKind, position: DVec3| {
+            let strength = strength(rng, kind, position);
+            spots.push(Self {
+                kind,
+                position,
+                strength,
+            });
+        };
 
-    pub fn is_strong(&self) -> bool {
-        self.strength >= STRONG_STRENGTH.0
+        // Primary: shared between the provinces by perimeter, then evenly
+        // around each edge from a random starting direction.
+        let total_radius: f64 = provinces.iter().map(|p| p.radius).sum();
+        let mut placed = 0;
+        for (i, p) in provinces.iter().enumerate() {
+            let n = if i + 1 == provinces.len() {
+                PRIMARY_HOTSPOTS - placed
+            } else {
+                ((PRIMARY_HOTSPOTS as f64 * p.radius / total_radius).round() as usize)
+                    .min(PRIMARY_HOTSPOTS - placed)
+            };
+            placed += n;
+            let step = std::f64::consts::TAU / n.max(1) as f64;
+            let start = rng.range(0.0, std::f64::consts::TAU);
+            for k in 0..n {
+                let azimuth = start
+                    + step
+                        * (k as f64 + rng.range(-PRIMARY_SPACING_JITTER, PRIMARY_SPACING_JITTER));
+                let edge = p.edge_point(azimuth);
+                let at = (edge + rng.unit_vector() * PLUME_EDGE_JITTER).normalize();
+                add(&mut rng, PlumeKind::Primary, at);
+            }
+        }
+
+        // Secondary: inside a province, kept more often where the mantle
+        // rises faster.
+        for k in 0..SECONDARY_HOTSPOTS {
+            let p = &provinces[k % provinces.len()];
+            let site = (0..SECONDARY_ATTEMPTS).find_map(|_| {
+                let at = (p.center + rng.unit_vector() * p.radius).normalize();
+                let rise = (mantle.upwelling(at) / peak_rise).clamp(0.0, 1.0);
+                (p.edge_distance(at) < 0.0 && rng.next_f64() < rise).then_some(at)
+            });
+            add(&mut rng, PlumeKind::Secondary, site.unwrap_or(p.center));
+        }
+
+        // Tertiary: near a spreading ridge or rift, anywhere if there are
+        // none.
+        let divergent: Vec<DVec3> = boundaries
+            .iter()
+            .filter(|b| matches!(b.kind, BoundaryKind::Ridge | BoundaryKind::Rift))
+            .map(|b| edges[b.edge as usize].mid)
+            .collect();
+        for _ in 0..TERTIARY_HOTSPOTS {
+            let at = if divergent.is_empty() {
+                rng.unit_vector()
+            } else {
+                let mid = divergent[(rng.next_f64() * divergent.len() as f64) as usize];
+                (mid + rng.unit_vector() * TERTIARY_JITTER).normalize()
+            };
+            add(&mut rng, PlumeKind::Tertiary, at);
+        }
+        spots
     }
 
     /// Weaker plumes' volcanoes are shorter-lived and their tracks shorter.
@@ -196,15 +338,28 @@ fn hotspot_track(
 
 impl World {
     pub fn generate(grid: &Grid, edges: &[Edge], seed: u64) -> Self {
-        let kind = crust::continents(grid, &mut Pcg32::for_part(seed, Stream::Continents));
+        let (kind, province) =
+            crust::continents(grid, &mut Pcg32::for_part(seed, Stream::Continents));
         let mut mantle = MantleFlow::earthlike(grid, &mut Pcg32::for_part(seed, Stream::Mantle));
         let mut flow = mantle.sample(grid);
         let mut age = vec![DEFAULT_OCEAN_AGE_MYR; grid.len()];
+        // Each cell's lithosphere before boundary features build on it: what
+        // decides which side sinks, how hard slabs pull and how keels drag.
+        let base_columns = |age: &[f64]| -> Vec<Column> {
+            (0..grid.len())
+                .map(|c| {
+                    province[c]
+                        .column()
+                        .unwrap_or_else(|| Column::oceanic(age[c], 0.0))
+                })
+                .collect()
+        };
+        let mut columns = base_columns(&age);
 
         let mut plates = Plates::generate_with(grid, seed, |majors| {
             let count = majors.iter().max().map_or(0, |&m| m as usize + 1);
-            let omega = solve_motion(grid, edges, majors, count, &kind, &flow, &[], &age);
-            let boundaries = classify(edges, majors, &omega, &kind, &age);
+            let omega = solve_motion(grid, edges, majors, count, &columns, &flow, &[]);
+            let boundaries = classify(edges, majors, &omega, &kind, &columns);
             // Back-arc sites: the overriding side of each trench.
             boundaries
                 .iter()
@@ -214,19 +369,11 @@ impl World {
         });
         let count = plates.plates.len();
 
-        let mut omega = solve_motion(
-            grid,
-            edges,
-            &plates.cell_plate,
-            count,
-            &kind,
-            &flow,
-            &[],
-            &age,
-        );
-        let mut boundaries = classify(edges, &plates.cell_plate, &omega, &kind, &age);
+        let mut omega = solve_motion(grid, edges, &plates.cell_plate, count, &columns, &flow, &[]);
+        let mut boundaries = classify(edges, &plates.cell_plate, &omega, &kind, &columns);
         for round in 0..MOTION_ROUNDS {
             age = ocean_ages(grid, edges, &plates.cell_plate, &kind, &boundaries);
+            columns = base_columns(&age);
             if round == 0 {
                 // Slabs sink under trenches and pull the mantle down with
                 // them (slab suction).
@@ -245,20 +392,28 @@ impl World {
                 edges,
                 &plates.cell_plate,
                 count,
-                &kind,
+                &columns,
                 &flow,
                 &boundaries,
-                &age,
             );
-            boundaries = classify(edges, &plates.cell_plate, &omega, &kind, &age);
+            boundaries = classify(edges, &plates.cell_plate, &omega, &kind, &columns);
         }
         age = ocean_ages(grid, edges, &plates.cell_plate, &kind, &boundaries);
+        let forces = boundary_forces(grid, edges, &boundaries, &base_columns(&age));
         for (plate, w) in plates.plates.iter_mut().zip(&omega) {
             plate.omega = *w;
         }
 
-        let mut crust = build_crust(grid, edges, &plates.cell_plate, kind, age, &boundaries);
-        let hotspots = Hotspot::scatter(seed, &mantle.provinces);
+        let mut crust = build_crust(
+            grid,
+            edges,
+            &plates.cell_plate,
+            kind,
+            province,
+            age,
+            &boundaries,
+        );
+        let hotspots = Hotspot::scatter(seed, &mantle, edges, &boundaries);
         let relief = hotspot_relief(
             grid,
             &plates.cell_plate,
@@ -267,6 +422,18 @@ impl World {
             &hotspots,
         );
         let dynamic_m = dynamic_topography(grid, &mantle);
+        // Fresh hotspot volcanoes show their lava.
+        for (c, mark) in relief.marks.iter().enumerate() {
+            if let Some(m) = mark
+                && m.age_myr < FRESH_VOLCANO_MYR
+            {
+                crust.rock[c] = if crust.kind[c].is_continental() {
+                    SurfaceRock::FloodBasalt
+                } else {
+                    SurfaceRock::Basalt
+                };
+            }
+        }
         for (c, e) in crust.elevation_m.iter_mut().enumerate() {
             *e += relief.elevation[c] + dynamic_m[c];
         }
@@ -281,6 +448,7 @@ impl World {
             crust,
             mantle,
             boundaries,
+            forces,
             dynamic_m,
         }
     }
@@ -397,45 +565,79 @@ struct HotspotRelief {
 }
 
 /// Thickness and elevation for every cell from crust kind, seafloor age and
+/// Every cell's column (sediment, crust, mantle lithosphere), its surface
+/// rock, and the elevation it floats at, from crust kind, seafloor age and
 /// the boundaries nearby.
 fn build_crust(
     grid: &Grid,
     edges: &[Edge],
     cell_plate: &[u32],
     kind: Vec<CrustKind>,
+    mut province: Vec<CrustProvince>,
     age: Vec<f64>,
     boundaries: &[Boundary],
 ) -> Crust {
     let n = grid.len();
-    // Uniform crust to start: every bit of relief below comes from a
-    // mechanism (boundaries, seafloor cooling, shelves, hotspots), none
-    // from noise.
-    let mut thickness: Vec<f64> = (0..n)
+    // Distance (km) from the nearest cell that isn't of `kind`, ignoring
+    // plates: how far inland, or how far offshore.
+    let distance_from_other = |continental: bool| {
+        flood(
+            grid,
+            None,
+            (0..n as u32)
+                .filter(|&c| kind[c as usize].is_continental() != continental)
+                .map(|c| (c, 0.0)),
+            |_, _, _, km| Some(km),
+        )
+    };
+    let inland = distance_from_other(true);
+    let offshore = distance_from_other(false);
+
+    // Uniform columns to start: every bit of relief below comes from a
+    // mechanism (boundaries, seafloor cooling, sediment, shelves, hotspots),
+    // none from noise.
+    // Distances above run between cell centers; the coastline itself lies
+    // about half a cell from the nearest center on either side.
+    let half_cell =
+        grid.centers[0].angle_between(grid.centers[grid.neighbors[0] as usize]) * RADIUS_KM / 2.0;
+    // Strength of the margin taper: 1 at the coastline, falling to 0 at
+    // `width` from it.
+    let taper = |km: f64, width: f64| (1.0 - (km - half_cell) / width).clamp(0.0, 1.0);
+    let mut column: Vec<Column> = (0..n)
         .map(|c| {
-            if kind[c].is_continental() {
-                CONTINENTAL_THICKNESS_KM
+            if let Some(base) = province[c].column() {
+                base
             } else {
-                OCEANIC_THICKNESS_KM
+                // Sediment builds up slowly on the open ocean floor and
+                // thickly off continents, from what rivers carry off the land.
+                let km = offshore[c].map_or(f64::MAX, |(km, _)| km);
+                let sediment = PELAGIC_KM_PER_MYR * age[c]
+                    + MARGIN_SEDIMENT_KM * (-km / MARGIN_WIDTH_KM).exp();
+                Column::oceanic(age[c], sediment)
             }
         })
         .collect();
-    // Extra seafloor relief (m) from trenches and island arcs.
-    let mut relief = vec![0.0f64; n];
-
-    // Continental shelves: crust thins toward the open ocean.
-    let coast = flood(
-        grid,
-        None,
-        (0..n as u32)
-            .filter(|&c| !kind[c as usize].is_continental())
-            .map(|c| (c, 0.0)),
-        |_, _, _, km| Some(km),
-    );
+    blend_province_edges(grid, &kind, &mut column);
     for c in 0..n {
-        if let (true, Some((km, _))) = (kind[c].is_continental(), coast[c]) {
-            thickness[c] -= SHELF_THINNING_KM * (-km / SHELF_WIDTH_KM).exp();
+        let col = &mut column[c];
+        if kind[c].is_continental() {
+            // Stretched continental crust thinning toward the coast.
+            let t = taper(
+                inland[c].map_or(f64::MAX, |(km, _)| km),
+                MARGIN_CONTINENT_KM,
+            );
+            col.crust_km -= (col.crust_km - COASTAL_CRUST_KM).max(0.0) * t;
+        } else {
+            // Transitional crust just offshore, between continental and
+            // oceanic in thickness and composition.
+            let t = taper(offshore[c].map_or(f64::MAX, |(km, _)| km), MARGIN_OCEAN_KM);
+            let extra = (TRANSITIONAL_CRUST_KM - col.crust_km).max(0.0) * t;
+            thicken(col, extra, TRANSITIONAL_FELSIC);
         }
     }
+    // Seafloor relief (m) that isostasy doesn't explain: trenches, where the
+    // sinking plate bends down.
+    let mut relief = vec![0.0f64; n];
 
     // Distance (km) within each plate from boundary cells of one kind,
     // carrying that boundary's rate scaled to 0..1.
@@ -469,49 +671,149 @@ fn build_crust(
     let collision = reach(&both_sides(BoundaryKind::Collision));
     let rift = reach(&both_sides(BoundaryKind::Rift));
 
+    // How strongly each cell is shaped by each feature, 0 to 1, for the
+    // surface rock.
+    let mut arc_at = vec![0.0f64; n];
+    let mut collision_at = vec![0.0f64; n];
+    let mut rift_at = vec![0.0f64; n];
     for c in 0..n {
         let continental = kind[c].is_continental();
-        // Where an arc and a collision overlap, the stronger wins rather
-        // than the two adding up: thickened crust spreads sideways instead
-        // of piling ever higher (Earth's thickest, under Tibet, is 70-80 km).
-        let mut thickening = 0.0f64;
         if let Some((km, s)) = trench[c]
             && !continental
         {
             relief[c] -= TRENCH_DEPTH_M * s * gaussian(km, 0.0, TRENCH_WIDTH_KM);
         }
         if let Some((km, s)) = arc[c] {
-            let profile = s * gaussian(km, ARC_DISTANCE_KM, ARC_WIDTH_KM);
-            if continental {
-                thickening = thickening.max(CONTINENTAL_ARC_KM * profile);
-            } else {
-                relief[c] += ISLAND_ARC_M * profile;
-            }
+            arc_at[c] = s * gaussian(km, ARC_DISTANCE_KM, ARC_WIDTH_KM);
         }
         if let (Some((km, s)), true) = (collision[c], continental) {
             let taper = 1.0 - smoothstep(PLATEAU_KM, PLATEAU_KM + PLATEAU_TAPER_KM, km);
-            thickening = thickening.max(COLLISION_KM * s * taper);
+            collision_at[c] = s * taper;
         }
-        thickness[c] += thickening;
         if let (Some((km, s)), true) = (rift[c], continental) {
-            thickness[c] -= RIFT_THINNING_KM * s.max(0.3) * gaussian(km, 0.0, RIFT_WIDTH_KM);
+            rift_at[c] = s.max(0.3) * gaussian(km, 0.0, RIFT_WIDTH_KM);
+        }
+
+        let col = &mut column[c];
+        // Active boundaries rework the crust they touch: whatever its age,
+        // it now has young, Phanerozoic lithosphere.
+        if continental
+            && [arc_at[c], collision_at[c], rift_at[c]]
+                .iter()
+                .any(|&x| x > 0.3)
+        {
+            province[c] = CrustProvince::Phanerozoic;
+            let young = CrustProvince::Phanerozoic.column().expect("continental");
+            col.mantle_km = young.mantle_km;
+            col.depletion = young.depletion;
+        }
+        if continental {
+            // Where an arc and a collision overlap, the stronger wins rather
+            // than the two adding up: thickened crust spreads sideways
+            // instead of piling ever higher (Earth's thickest, under Tibet,
+            // is 70-80 km). Arcs add new, more felsic crust; collisions
+            // stack the crust that is already there.
+            let arc_km = CONTINENTAL_ARC_KM * arc_at[c];
+            let collision_km = COLLISION_KM * collision_at[c];
+            if arc_km >= collision_km {
+                thicken(col, arc_km, CONTINENTAL_ARC_FELSIC);
+            } else {
+                thicken(col, collision_km, col.felsic);
+            }
+            col.crust_km -= RIFT_THINNING_KM * rift_at[c];
+        } else {
+            // Island arcs build new crust of intermediate composition.
+            thicken(col, ISLAND_ARC_CRUST_KM * arc_at[c], ISLAND_ARC_FELSIC);
         }
     }
 
-    let elevation = (0..n)
+    let elevation: Vec<f64> = (0..n)
+        .map(|c| column[c].elevation_m() + relief[c])
+        .collect();
+    let rock = (0..n)
         .map(|c| {
+            let strong = |x: f64| x > 0.3;
             if kind[c].is_continental() {
-                continental_elevation_m(thickness[c])
+                if strong(collision_at[c]) {
+                    SurfaceRock::Metamorphic
+                } else if strong(arc_at[c]) {
+                    SurfaceRock::Andesite
+                } else if strong(rift_at[c]) || elevation[c] < EXPOSED_BASEMENT_M {
+                    SurfaceRock::Sediment
+                } else {
+                    SurfaceRock::Granite
+                }
+            } else if strong(arc_at[c]) {
+                SurfaceRock::Andesite
+            } else if column[c].sediment_km < BARE_SEAFLOOR_KM {
+                SurfaceRock::Basalt
             } else {
-                ocean_depth_m(age[c]) + relief[c]
+                SurfaceRock::OceanSediment
             }
         })
         .collect();
     Crust {
         kind,
-        thickness_km: thickness,
+        province,
+        column,
         age_myr: age,
         elevation_m: elevation,
+        rock,
+    }
+}
+
+/// Smooths continental columns across province edges, so roots and crust
+/// step gradually rather than in walls. Each layer's thickness and its
+/// buoyancy are averaged with continental neighbors, then composition and
+/// depletion are recomputed to match: buoyancy, and so elevation, blends
+/// smoothly too. Oceanic cells take no part.
+fn blend_province_edges(grid: &Grid, kind: &[CrustKind], column: &mut [Column]) {
+    let rho_a = crust::RHO_ASTHENOSPHERE;
+    // (crust km, crust buoyancy, mantle km, mantle buoyancy)
+    let parts = |c: &Column| {
+        [
+            c.crust_km,
+            (rho_a - crust::crust_density(c.felsic)) * c.crust_km,
+            c.mantle_km,
+            (rho_a - crust::mantle_lithosphere_density(c.depletion)) * c.mantle_km,
+        ]
+    };
+    for _ in 0..PROVINCE_BLEND_PASSES {
+        let blended: Vec<Option<[f64; 4]>> = (0..grid.len())
+            .map(|c| {
+                if !kind[c].is_continental() {
+                    return None;
+                }
+                let cells: Vec<u32> = std::iter::once(c as u32)
+                    .chain(grid.neighbors_of(c as u32))
+                    .filter(|&x| kind[x as usize].is_continental())
+                    .collect();
+                let mut sum = [0.0; 4];
+                for &x in &cells {
+                    for (s, p) in sum.iter_mut().zip(parts(&column[x as usize])) {
+                        *s += p;
+                    }
+                }
+                Some(sum.map(|s| s / cells.len() as f64))
+            })
+            .collect();
+        for (col, blend) in column.iter_mut().zip(blended) {
+            if let Some([crust_km, crust_b, mantle_km, mantle_b]) = blend {
+                col.crust_km = crust_km;
+                col.felsic = crust::felsic_for(crust_km, crust_b);
+                col.mantle_km = mantle_km;
+                col.depletion = crust::depletion_for(mantle_km, mantle_b);
+            }
+        }
+    }
+}
+
+/// Adds `km` of crust of composition `felsic` to a column, mixing the
+/// composition by thickness.
+fn thicken(col: &mut Column, km: f64, felsic: f64) {
+    if km > 0.0 {
+        col.felsic = (col.felsic * col.crust_km + felsic * km) / (col.crust_km + km);
+        col.crust_km += km;
     }
 }
 
@@ -566,7 +868,7 @@ mod tests {
             assert!(min < -6000.0, "seed {seed}: deepest {min}");
             let thickest = (0..e.len())
                 .filter(|&c| w.crust.kind[c].is_continental())
-                .map(|c| w.crust.thickness_km[c])
+                .map(|c| w.crust.column[c].crust_km)
                 .fold(0.0, f64::max);
             assert!(thickest < 80.0, "seed {seed}: crust {thickest:.0} km thick");
             // Every boundary type shows up somewhere on a world this size.
@@ -597,6 +899,7 @@ mod tests {
         let at = |lon: f64, lat: f64| grid.cell_at(LonLat::new(lon, lat)) as usize;
         let ocean = vec![CrustKind::Oceanic; grid.len()];
         let hawaii = [Hotspot {
+            kind: PlumeKind::Primary,
             position: plume.to_unit(),
             strength: 1.0,
         }];
@@ -628,6 +931,7 @@ mod tests {
 
         // A weak plume makes far less: a seamount, not an island.
         let weak = [Hotspot {
+            kind: PlumeKind::Tertiary,
             position: plume.to_unit(),
             strength: 0.2,
         }];
@@ -637,24 +941,62 @@ mod tests {
     }
 
     #[test]
-    fn strong_plumes_rise_at_province_edges() {
+    fn plumes_rise_where_their_kind_comes_from() {
         let s = setup();
-        let w = World::generate(&s.grid, &s.edges, 5);
-        let strong: Vec<&Hotspot> = w.hotspots.iter().filter(|h| h.is_strong()).collect();
-        assert_eq!(strong.len(), STRONG_HOTSPOTS);
-        for h in strong {
-            let to_edge = w
-                .mantle
-                .provinces
+        for seed in [5, 6, 7] {
+            let w = World::generate(&s.grid, &s.edges, seed);
+            let of = |kind| w.hotspots.iter().filter(move |h| h.kind == kind);
+            assert_eq!(of(PlumeKind::Primary).count(), PRIMARY_HOTSPOTS);
+            assert_eq!(of(PlumeKind::Secondary).count(), SECONDARY_HOTSPOTS);
+            assert_eq!(of(PlumeKind::Tertiary).count(), TERTIARY_HOTSPOTS);
+            let provinces = &w.mantle.provinces;
+            let to_edge = |p: DVec3| {
+                provinces
+                    .iter()
+                    .map(|v| v.edge_distance(p))
+                    .fold(f64::MAX, |m, d| if d.abs() < m.abs() { d } else { m })
+            };
+            for h in of(PlumeKind::Primary) {
+                let d = to_edge(h.position).abs();
+                assert!(
+                    d < 2.0 * PLUME_EDGE_JITTER,
+                    "seed {seed}: primary {d:.3} rad off an edge"
+                );
+            }
+            for h in of(PlumeKind::Secondary) {
+                assert!(
+                    provinces
+                        .iter()
+                        .any(|p| p.edge_distance(h.position) <= 1e-9),
+                    "seed {seed}: secondary outside every province"
+                );
+            }
+            let divergent: Vec<DVec3> = w
+                .boundaries
                 .iter()
-                .map(|p| p.edge_distance(h.position).abs())
-                .fold(f64::MAX, f64::min);
-            assert!(
-                to_edge < 2.0 * PLUME_EDGE_JITTER,
-                "{:.3} rad from an edge",
-                to_edge
-            );
+                .filter(|b| matches!(b.kind, BoundaryKind::Ridge | BoundaryKind::Rift))
+                .map(|b| s.edges[b.edge as usize].mid)
+                .collect();
+            for h in of(PlumeKind::Tertiary) {
+                let near = divergent
+                    .iter()
+                    .map(|m| m.angle_between(h.position))
+                    .fold(f64::MAX, f64::min);
+                assert!(
+                    near < 2.0 * TERTIARY_JITTER,
+                    "seed {seed}: tertiary {near:.3} rad from a ridge"
+                );
+            }
+            // Strength ranks by kind: every primary beats every tertiary.
+            let weakest_primary = of(PlumeKind::Primary)
+                .map(|h| h.strength)
+                .fold(1.0, f64::min);
+            let strongest_tertiary = of(PlumeKind::Tertiary)
+                .map(|h| h.strength)
+                .fold(0.0, f64::max);
+            assert!(weakest_primary > strongest_tertiary, "seed {seed}");
         }
+        let w = World::generate(&s.grid, &s.edges, 5);
         for (h, track) in w.hotspots.iter().zip(&w.hotspot_tracks) {
             assert!(
                 track[0].abs_diff_eq(h.position, 1e-12),
@@ -710,7 +1052,12 @@ mod tests {
                 .grid
                 .neighbors_of(c)
                 .any(|n| w.plates.cell_plate[n as usize] != w.plates.cell_plate[c as usize]);
-            on_boundary || !kind[c as usize].is_continental()
+            // Province edges blend the columns either side.
+            let province_edge = s
+                .grid
+                .neighbors_of(c)
+                .any(|n| w.crust.province[n as usize] != w.crust.province[c as usize]);
+            on_boundary || province_edge || !kind[c as usize].is_continental()
         });
         let reach = flood(&s.grid, None, sources.map(|c| (c, 0.0)), |_, _, _, km| {
             Some(km)
@@ -720,11 +1067,10 @@ mod tests {
             if let (true, Some((km, _))) = (kind[c].is_continental(), reach[c])
                 && km > 1000.0
             {
-                let t = w.crust.thickness_km[c];
-                assert!(
-                    (t - CONTINENTAL_THICKNESS_KM).abs() < 0.01,
-                    "cell {c}: {t} km"
-                );
+                // Its province's starting crust, untouched.
+                let t = w.crust.column[c].crust_km;
+                let base = w.crust.province[c].column().unwrap().crust_km;
+                assert!((t - base).abs() < 0.01, "cell {c}: {t} km, not {base}");
                 checked += 1;
             }
         }

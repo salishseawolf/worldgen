@@ -1,35 +1,46 @@
 //! Plate motion and plate boundaries.
 //!
 //! Each plate's angular velocity comes from a balance of torques: mantle flow
-//! drags on the plate's base (more under continents, whose deep keels
-//! resist), and boundary forces act on its edges. Slab pull dominates: a
-//! slab sinking at a trench pulls its plate with a force that grows with the
-//! square root of the slab's age (McNutt 1984), which is why plates attached
-//! to slabs move several times faster than those riding over them (Forsyth &
-//! Uyeda 1975; Conrad & Lithgow-Bertelloni 2002). Ridge push is about a
-//! tenth as strong.
+//! drags on the plate's base, more where the lithosphere's root (keel)
+//! reaches deeper, and boundary forces act on its edges. Slab pull
+//! dominates: a slab sinking at a trench pulls its plate in proportion to
+//! how much heavier it is than the mantle, plus the extra weight of its
+//! crust turning to dense eclogite at depth (McKenzie 1969). That is why
+//! plates attached to slabs move several times faster than those riding over
+//! them (Forsyth & Uyeda 1975; Conrad & Lithgow-Bertelloni 2002). Ridge push
+//! is about a tenth as strong.
 //!
-//! Every boundary edge is then classified from the plates' relative motion,
-//! and subduction polarity follows buoyancy: continents don't sink, and of
-//! two oceanic plates the older, denser one goes down.
+//! Every boundary edge is then classified from the plates' relative motion.
+//! Where plates converge, the side whose lithosphere column is less buoyant
+//! sinks: old seafloor before young, any seafloor before a continent, whose
+//! thick light crust keeps it afloat (Cloos 1993). If both sides carry such
+//! crust, neither sinks and they collide.
 
 use std::cmp::Ordering;
 use std::collections::{BinaryHeap, HashMap};
 
 use glam::{DMat3, DVec3};
 
-use crate::crust::CrustKind;
+use crate::crust::{Column, CrustKind};
 use crate::geo::EARTH_RADIUS_M;
 use crate::grid::Grid;
 use crate::mantle::CM_PER_YEAR;
 
-/// Basal drag per cell relative to oceanic lithosphere: continental keels
-/// reach deeper into the mantle and resist more.
-const CONTINENTAL_DRAG: f64 = 3.0;
+/// Basal drag per cell: 1 for lithosphere up to `KEEL_FREE_KM` thick, plus
+/// this much per 100 km of root below that, so deep continental keels
+/// (cratons reach over 200 km) resist the mantle most.
+const KEEL_FREE_KM: f64 = 100.0;
+const KEEL_DRAG_PER_100_KM: f64 = 2.0;
 /// Boundary forces per unit edge length, in the same units as basal drag
-/// (drag coefficient times rad/Myr per cell). Slab pull is for a 100 Myr
-/// slab and scales with sqrt(age).
-const SLAB_PULL: f64 = 0.4;
+/// (drag coefficient times rad/Myr per cell). Slab pull is for a slab as
+/// heavy as 100 Myr seafloor and scales with the slab's excess weight.
+pub const SLAB_PULL: f64 = 0.4;
+/// Subducted crust turns to eclogite, about this much denser than the
+/// mantle (kg/m³; eclogite runs 3,450 to 3,750 against 3,300).
+const ECLOGITE_EXCESS: f64 = 200.0;
+/// Where both sides' columns are at least this buoyant (kg/m³·km, see
+/// `Column::buoyancy`: about 15 km or more of light crust), neither sinks.
+const COLLISION_BUOYANCY: f64 = 6000.0;
 const RIDGE_PUSH: f64 = 0.04;
 /// Overriding plates are drawn gently toward the trench.
 const TRENCH_SUCTION: f64 = 0.06;
@@ -135,36 +146,20 @@ pub fn solve_motion(
     edges: &[Edge],
     cell_plate: &[u32],
     plate_count: usize,
-    crust: &[CrustKind],
+    columns: &[Column],
     mantle: &[DVec3],
     boundaries: &[Boundary],
-    age: &[f64],
 ) -> Vec<DVec3> {
     let mut lhs = vec![DMat3::ZERO; plate_count];
     let mut rhs = vec![DVec3::ZERO; plate_count];
     for (cell, &p) in grid.centers.iter().enumerate() {
         let plate = cell_plate[cell] as usize;
-        let k = if crust[cell].is_continental() {
-            CONTINENTAL_DRAG
-        } else {
-            1.0
-        };
+        let k = keel_drag(&columns[cell]);
         lhs[plate] += (DMat3::IDENTITY - DMat3::from_cols(p * p.x, p * p.y, p * p.z)) * k;
         rhs[plate] += p.cross(mantle[cell]) * k;
     }
 
-    // Edge lengths in units of a typical cell edge, so forces don't depend
-    // on grid resolution relative to drag (which sums over cells).
-    let cell_edge = (4.0 * std::f64::consts::PI / grid.len() as f64).sqrt();
-    let mut push = |cell: u32, e: &Edge, normal: DVec3, toward_other: bool, strength: f64| {
-        let dir = if (cell == e.a) == toward_other {
-            normal
-        } else {
-            -normal
-        };
-        let force = dir * strength * e.length / cell_edge;
-        rhs[cell_plate[cell as usize] as usize] += e.mid.cross(force);
-    };
+    let cell_edge = cell_edge(grid);
     for b in boundaries {
         let e = &edges[b.edge as usize];
         // Resistance along the edge, on both plates.
@@ -179,25 +174,9 @@ pub fn solve_motion(
             lhs[cell_plate[cell as usize] as usize] +=
                 (DMat3::IDENTITY - DMat3::from_cols(m * m.x, m * m.y, m * m.z)) * drag;
         }
-        let n = b.normal;
-        match b.kind {
-            BoundaryKind::Subduction => {
-                let slab_age = age[b.subducting as usize].clamp(10.0, 150.0);
-                push(
-                    b.subducting,
-                    e,
-                    n,
-                    true,
-                    SLAB_PULL * (slab_age / 100.0).sqrt(),
-                );
-                push(b.overriding(edges), e, n, true, TRENCH_SUCTION);
-            }
-            BoundaryKind::Ridge => {
-                push(e.a, e, n, false, RIDGE_PUSH);
-                push(e.b, e, n, false, RIDGE_PUSH);
-            }
-            _ => {}
-        }
+    }
+    for f in boundary_forces(grid, edges, boundaries, columns) {
+        rhs[cell_plate[f.cell as usize] as usize] += f.at.cross(f.dir * f.strength * f.length);
     }
 
     let mut omega: Vec<DVec3> = lhs
@@ -225,13 +204,112 @@ pub fn solve_motion(
     omega
 }
 
-/// Classifies every edge between two plates.
+/// Basal drag of a column: deeper roots (keels) resist the mantle more.
+pub fn keel_drag(col: &Column) -> f64 {
+    1.0 + KEEL_DRAG_PER_100_KM * (col.thickness_km() - KEEL_FREE_KM).max(0.0) / 100.0
+}
+
+/// How hard a column pulls as a slab, relative to 100 Myr seafloor: its
+/// weight beyond the mantle's (negative buoyancy) plus its crust turned to
+/// eclogite. Zero for columns light enough to resist sinking.
+pub fn slab_pull_factor(col: &Column) -> f64 {
+    let weight = |c: &Column| -c.buoyancy() + ECLOGITE_EXCESS * c.crust_km;
+    (weight(col) / weight(&Column::oceanic(100.0, 0.0))).max(0.0)
+}
+
+/// Edge lengths in units of a typical cell edge, so forces don't depend
+/// on grid resolution relative to drag (which sums over cells).
+fn cell_edge(grid: &Grid) -> f64 {
+    (4.0 * std::f64::consts::PI / grid.len() as f64).sqrt()
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum ForceKind {
+    /// A sinking slab pulling its plate toward the trench.
+    SlabPull,
+    /// Ridge push, away from a spreading ridge.
+    RidgePush,
+    /// The overriding plate drawn gently toward the trench.
+    TrenchSuction,
+}
+
+/// A force on a plate at one boundary edge.
+#[derive(Clone, Copy, Debug)]
+pub struct BoundaryForce {
+    pub kind: ForceKind,
+    /// The boundary edge it acts across (index into the edge list).
+    pub edge: u32,
+    /// The cell (on the plate) it acts on.
+    pub cell: u32,
+    /// Where it acts (the edge's midpoint) and which way (unit tangent).
+    pub at: DVec3,
+    pub dir: DVec3,
+    /// Per unit edge length, in drag units (see the constants above).
+    pub strength: f64,
+    /// Edge length in typical-cell-edge units.
+    pub length: f64,
+    /// Edge length (km).
+    pub length_km: f64,
+}
+
+/// Every boundary force the motion solve applies.
+pub fn boundary_forces(
+    grid: &Grid,
+    edges: &[Edge],
+    boundaries: &[Boundary],
+    columns: &[Column],
+) -> Vec<BoundaryForce> {
+    let cell_edge = cell_edge(grid);
+    let mut forces = Vec::new();
+    for b in boundaries {
+        let e = &edges[b.edge as usize];
+        let mut add = |kind, cell: u32, toward_other: bool, strength: f64| {
+            let dir = if (cell == e.a) == toward_other {
+                b.normal
+            } else {
+                -b.normal
+            };
+            forces.push(BoundaryForce {
+                kind,
+                edge: b.edge,
+                cell,
+                at: e.mid,
+                dir,
+                strength,
+                length: e.length / cell_edge,
+                length_km: e.length * RADIUS_KM,
+            });
+        };
+        match b.kind {
+            BoundaryKind::Subduction => {
+                let pull = SLAB_PULL * slab_pull_factor(&columns[b.subducting as usize]);
+                add(ForceKind::SlabPull, b.subducting, true, pull);
+                add(
+                    ForceKind::TrenchSuction,
+                    b.overriding(edges),
+                    true,
+                    TRENCH_SUCTION,
+                );
+            }
+            BoundaryKind::Ridge => {
+                add(ForceKind::RidgePush, e.a, false, RIDGE_PUSH);
+                add(ForceKind::RidgePush, e.b, false, RIDGE_PUSH);
+            }
+            _ => {}
+        }
+    }
+    forces
+}
+
+/// Classifies every edge between two plates. `columns` give each cell's
+/// lithosphere, for which side sinks; `crust` whether divergence splits a
+/// continent (rift) or seafloor (ridge).
 pub fn classify(
     edges: &[Edge],
     cell_plate: &[u32],
     omega: &[DVec3],
     crust: &[CrustKind],
-    age: &[f64],
+    columns: &[Column],
 ) -> Vec<Boundary> {
     boundary_normals(edges, cell_plate)
         .into_iter()
@@ -250,18 +328,16 @@ pub fn classify(
                     (BoundaryKind::Transform, speed * to_cm, e.a)
                 } else if closing > 0.0 {
                     let rate = closing * to_cm;
-                    match (ka.is_continental(), kb.is_continental()) {
-                        (true, true) => (BoundaryKind::Collision, rate, e.a),
-                        (false, true) => (BoundaryKind::Subduction, rate, e.a),
-                        (true, false) => (BoundaryKind::Subduction, rate, e.b),
-                        (false, false) => {
-                            let older = if age[e.a as usize] >= age[e.b as usize] {
-                                e.a
-                            } else {
-                                e.b
-                            };
-                            (BoundaryKind::Subduction, rate, older)
-                        }
+                    let (ba, bb) = (
+                        columns[e.a as usize].buoyancy(),
+                        columns[e.b as usize].buoyancy(),
+                    );
+                    if ba.min(bb) >= COLLISION_BUOYANCY {
+                        (BoundaryKind::Collision, rate, e.a)
+                    } else {
+                        // The less buoyant side sinks.
+                        let sinking = if ba <= bb { e.a } else { e.b };
+                        (BoundaryKind::Subduction, rate, sinking)
                     }
                 } else {
                     let kind = if ka.is_continental() || kb.is_continental() {
@@ -465,17 +541,8 @@ mod tests {
         let cell_plate = vec![0; grid.len()];
         let spin = DVec3::new(0.3, 1.0, -0.2).normalize() * 0.01;
         let mantle: Vec<DVec3> = grid.centers.iter().map(|&p| spin.cross(p)).collect();
-        let crust = vec![CrustKind::Oceanic; grid.len()];
-        let omega = solve_motion(
-            &grid,
-            &edges(&grid),
-            &cell_plate,
-            1,
-            &crust,
-            &mantle,
-            &[],
-            &[],
-        );
+        let columns = vec![Column::oceanic(50.0, 0.0); grid.len()];
+        let omega = solve_motion(&grid, &edges(&grid), &cell_plate, 1, &columns, &mantle, &[]);
         // Same axis; the speed is renormalized.
         assert!(omega[0].normalize().abs_diff_eq(spin.normalize(), 1e-9));
     }
@@ -485,7 +552,7 @@ mod tests {
         let grid = Grid::new(Resolution::Two);
         let edges = edges(&grid);
         let cell_plate = hemispheres(&grid);
-        let crust = vec![CrustKind::Oceanic; grid.len()];
+        let columns = vec![Column::oceanic(100.0, 0.0); grid.len()];
         let still = vec![DVec3::ZERO; grid.len()];
         // The south plate subducts northward under the north plate all
         // along the equator.
@@ -510,7 +577,6 @@ mod tests {
                 },
             })
             .collect();
-        let age = vec![100.0; grid.len()];
         // A ring of equal pull has no net torque, so only the half of the
         // trench with x > 0 pulls.
         let half: Vec<Boundary> = boundaries
@@ -518,7 +584,7 @@ mod tests {
             .copied()
             .filter(|b| edges[b.edge as usize].mid.x > 0.0)
             .collect();
-        let omega_half = solve_motion(&grid, &edges, &cell_plate, 2, &crust, &still, &half, &age);
+        let omega_half = solve_motion(&grid, &edges, &cell_plate, 2, &columns, &still, &half);
         // The south plate's surface at the trench (lon 0) moves north.
         let at_trench = omega_half[1].cross(DVec3::X);
         assert!(at_trench.y > 0.0, "{at_trench}");
@@ -536,44 +602,66 @@ mod tests {
         // they move apart.
         let omega = [DVec3::X * 0.01, -DVec3::X * 0.01];
         let oceanic = vec![CrustKind::Oceanic; grid.len()];
-        let mut age = vec![50.0; grid.len()];
-        for (c, a) in age.iter_mut().enumerate() {
-            if cell_plate[c] == 1 {
-                *a = 120.0;
-            }
-        }
-        let kinds = |crust: &[CrustKind]| {
-            classify(&edges, &cell_plate, &omega, crust, &age)
+        let continent = crate::crust::CrustProvince::Proterozoic.column().unwrap();
+        // North and south columns, by plate.
+        let split = |north: Column, south: Column| -> Vec<Column> {
+            cell_plate
+                .iter()
+                .map(|&p| if p == 0 { north } else { south })
+                .collect()
+        };
+        let kinds = |columns: &[Column]| {
+            classify(&edges, &cell_plate, &omega, &oceanic, columns)
                 .into_iter()
                 .filter(|b| edges[b.edge as usize].mid.dot(DVec3::Z) > 0.99)
                 .collect::<Vec<_>>()
         };
-        for b in kinds(&oceanic) {
+        let ocean = |age| Column::oceanic(age, 0.0);
+        let older_south = split(ocean(50.0), ocean(120.0));
+        assert!(!kinds(&older_south).is_empty());
+        for b in kinds(&older_south) {
             assert_eq!(b.kind, BoundaryKind::Subduction);
             assert_eq!(cell_plate[b.subducting as usize], 1, "older plate sinks");
         }
-        // Make the south continental: the younger oceanic north sinks.
-        let mut mixed = oceanic.clone();
-        for (c, k) in mixed.iter_mut().enumerate() {
-            if cell_plate[c] == 1 {
-                *k = CrustKind::Continental;
-            }
-        }
-        for b in kinds(&mixed) {
+        // A continent to the south: even young seafloor to the north sinks.
+        for b in kinds(&split(ocean(5.0), continent)) {
             assert_eq!(cell_plate[b.subducting as usize], 0, "continents float");
         }
-        let continental = vec![CrustKind::Continental; grid.len()];
+        // Thick light crust on both sides: neither sinks.
         assert!(
-            kinds(&continental)
+            kinds(&split(continent, continent))
                 .iter()
                 .all(|b| b.kind == BoundaryKind::Collision)
         );
-        assert!(!kinds(&oceanic).is_empty());
-        let apart = classify(&edges, &cell_plate, &omega, &oceanic, &age)
+        // An oceanic plateau (thick crust) jams the trench too.
+        let plateau = Column {
+            crust_km: 25.0,
+            ..ocean(20.0)
+        };
+        assert!(
+            kinds(&split(plateau, continent))
+                .iter()
+                .all(|b| b.kind == BoundaryKind::Collision)
+        );
+        let apart = classify(&edges, &cell_plate, &omega, &oceanic, &older_south)
             .into_iter()
             .filter(|b| edges[b.edge as usize].mid.dot(-DVec3::Z) > 0.99)
             .collect::<Vec<_>>();
         assert!(!apart.is_empty() && apart.iter().all(|b| b.kind == BoundaryKind::Ridge));
+    }
+
+    #[test]
+    fn slab_pull_and_keel_drag_follow_the_column() {
+        let pull = |age| slab_pull_factor(&Column::oceanic(age, 0.0));
+        assert!((pull(100.0) - 1.0).abs() < 1e-12);
+        assert!(pull(150.0) > pull(100.0) && pull(100.0) > pull(30.0));
+        // Brand-new seafloor and continents are too light to pull.
+        assert_eq!(pull(0.0), 0.0);
+        let craton = crate::crust::CrustProvince::Archean.column().unwrap();
+        assert_eq!(slab_pull_factor(&craton), 0.0);
+        // Deep keels drag; seafloor lithosphere barely.
+        assert_eq!(keel_drag(&Column::oceanic(100.0, 0.0)), 1.0);
+        assert!(keel_drag(&craton) > 3.0, "{}", keel_drag(&craton));
     }
 
     #[test]

@@ -3,6 +3,8 @@
 #![cfg_attr(not(target_arch = "wasm32"), allow(dead_code))]
 
 mod camera;
+mod column_view;
+mod cross_section;
 mod crust;
 mod geo;
 mod grid;

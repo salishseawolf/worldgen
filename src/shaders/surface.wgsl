@@ -10,6 +10,16 @@ struct CellData {
     thickness_km: f32,
     // Elevation from vertical mantle flow (m).
     dynamic_m: f32,
+    // Crust composition, 0 mafic to 1 felsic.
+    felsic: f32,
+    // Whole lithosphere thickness (km).
+    lithosphere_km: f32,
+    // Column density minus the asthenosphere's (kg/m³).
+    density_excess: f32,
+    // Index into the surface rock colors.
+    rock: u32,
+    // Index into the age province colors.
+    province: u32,
 };
 
 @group(1) @binding(0) var<storage, read> cells: array<CellData>;
@@ -27,8 +37,13 @@ const ELEVATION_AT: u32 = 0u;
 const AGE_AT: u32 = 12u;
 const THICKNESS_AT: u32 = 24u;
 const MANTLE_AT: u32 = 36u;
-const NO_AGE_AT: u32 = 48u;
-const OCEANIC_CRUST_AT: u32 = 49u;
+const COMPOSITION_AT: u32 = 48u;
+const LITHOSPHERE_AT: u32 = 60u;
+const BUOYANCY_AT: u32 = 72u;
+const NO_AGE_AT: u32 = 84u;
+const OCEANIC_CRUST_AT: u32 = 85u;
+const ROCK_AT: u32 = 86u;
+const PROVINCE_AT: u32 = 93u;
 
 // Color of `value` along the ramp starting at entry `at`, interpolating
 // between stops and clamping at the ends.
@@ -66,6 +81,21 @@ fn surface_albedo(cell: u32) -> vec3<f32> {
         }
         case COLOR_MANTLE: {
             return ramp(MANTLE_AT, d.dynamic_m);
+        }
+        case COLOR_ROCK: {
+            return palettes[ROCK_AT + d.rock].rgb;
+        }
+        case COLOR_COMPOSITION: {
+            return ramp(COMPOSITION_AT, d.felsic);
+        }
+        case COLOR_LITHOSPHERE: {
+            return ramp(LITHOSPHERE_AT, d.lithosphere_km);
+        }
+        case COLOR_BUOYANCY: {
+            return ramp(BUOYANCY_AT, d.density_excess);
+        }
+        case COLOR_PROVINCE: {
+            return palettes[PROVINCE_AT + d.province].rgb;
         }
         default: {
             return plate_color[d.plate].rgb;
